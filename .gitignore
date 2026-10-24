@@ -42,3 +42,6 @@ Thumbs.db
 outputs/
 docs/local/
 archive/local/
+
+# 本地测试 fixture（含真实 agent 提示词原文，不入库）
+testdata/

@@ -101,18 +101,24 @@ func logDSHPromptCompatibility(r *http.Request, requestID uint64, obj map[string
 	gui := normalizeDSHGUIContexts(obj)
 	system := normalizeDSHIdentityPrefixes(obj, "system")
 	assistant := normalizeDSHIdentityPrefixes(obj, "assistant")
-	if system+assistant+gui == 0 {
+	// identity.go 只处理品牌词（DeepSeek Harness / Claude Code 等），
+	// 代码标识符（__DSH_BOOT__、dsh web、裸 DSH）由 normalizeDSHIdentifiers 用 base64 承载。
+	// 放在最后执行：三条标识符规则的目标串与身份替换的匹配串没有重叠，顺序不影响结果，
+	// 但放在最后能确保标识符规则读到的是已定型的文本，便于日志区分各自贡献。
+	identifiers := normalizeDSHIdentifiers(obj)
+	if system+assistant+gui+identifiers == 0 {
 		return
 	}
 	trace := debugTraceID(r)
 	if trace == "" {
 		trace = r.Header.Get("X-Trace-ID")
 	}
-	log.Printf("[DSH提示词兼容] traceId=%s requestId=%d system前缀=%d assistant前缀=%d GUI环境句=%d 结果=已改写为中性描述，未记录提示词正文",
-		trace, requestID, system, assistant, gui)
+	log.Printf("[DSH提示词兼容] traceId=%s requestId=%d system前缀=%d assistant前缀=%d GUI环境句=%d 标识符规则=%d 结果=已改写为中性描述，未记录提示词正文",
+		trace, requestID, system, assistant, gui, identifiers)
 	debugEvent(r, "info", "dsh_prompt_compatibility", map[string]any{
 		"system_prefix_parts": system, "assistant_prefix_parts": assistant,
-		"gui_context_matches": gui, "prompt_body_logged": false,
+		"gui_context_matches": gui, "identifier_rules": identifiers,
+		"prompt_body_logged": false,
 	})
 }
 
