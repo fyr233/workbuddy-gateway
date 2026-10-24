@@ -350,10 +350,10 @@ func TestGlobalAccountRuleCannotBeOverridden(t *testing.T) {
 	if ok, reason := modelAccountAllowed("m", a, accounts); ok || !strings.Contains(reason, "全局") {
 		t.Fatal("模型白名单绕过全局停用")
 	}
-	if acc, _, err := nextAccountForModel("other", nil); err != nil || acc != b {
+	if acc, _, err := nextAccountForModel("other", nil, ""); err != nil || acc != b {
 		t.Fatalf("未配置模型必须遵守全局规则: %v", err)
 	}
-	if _, _, err := nextAccountForModel("m", nil); err == nil {
+	if _, _, err := nextAccountForModel("m", nil, ""); err == nil {
 		t.Fatal("应拒绝无法调度的模型")
 	}
 	if rows := buildAllModelStatSnapshots(time.Now(), accounts); len(rows) != 1 || rows[0].ID != "m" || rows[0].AvailableAccounts != 0 {

@@ -602,6 +602,7 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 	statsObserveUsage(r, usage, true)
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
+	recordAccountTokens(acc, tokenCountOf(usage))
 	recordModelLatency(modelName, time.Since(startTime))
 	out, err := chatCompletionToResponsesWithTools(completionJSON, modelName, responsesToolMapFor(r))
 	if err != nil {
@@ -1096,6 +1097,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
+	recordAccountTokens(acc, tokenCountOf(usage))
 	emit("response.completed", map[string]any{"response": final})
 
 	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")

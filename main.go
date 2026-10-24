@@ -1287,6 +1287,13 @@ func reloadAccountsResult() (bool, error) {
 	} else {
 		rrIndex = 0
 	}
+	// 账号池收缩后，清掉已移除账号的加权计数与会话绑定，避免残留状态影响后续调度。
+	alive := make(map[string]bool, len(accounts))
+	for _, acc := range accounts {
+		alive[acc.Path] = true
+	}
+	pruneWeightCounters(alive)
+	pruneStickyBindings(alive)
 	return changed, errors.Join(failures...)
 }
 
@@ -1376,7 +1383,7 @@ func usableForModelLocked(acc *Account, model string, now time.Time) (accountSel
 }
 
 // nextAccountForModel 按「免费耗尽账号优先 → 有余额账号 → 零余额未知模型受控探测」选号。
-func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, accountSelectionKind, error) {
+func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey string) (*Account, accountSelectionKind, error) {
 	// 站点优先级必须在加锁前计算：preferredFreeSites 会读取账号账本并自行获取 accountMu，
 	// 若在持锁期间调用会自锁。语义：该模型「一个站点免费、另一个站点收费」时优先用免费站点，
 	// 直到该站点账号全部不可用；其余情况不搞优先，正常轮询。
@@ -1399,8 +1406,45 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 	}
 	now := time.Now()
 
-	pick := func(siteFilter func(string) bool) (*Account, accountSelectionKind, bool) {
+	// 会话粘性：同一会话优先复用上次绑定的账号，让上游前缀缓存持续命中。
+	// 绑定的账号不可用（冷却 / 越线 / 名单不符 / 本轮回已试过）时立即解绑，走正常选号。
+	if sessionKey != "" {
+		if bound := stickyLookup(sessionKey, now); bound != "" {
+			for _, acc := range accounts {
+				if acc.Path != bound {
+					continue
+				}
+				if attempted != nil && attempted[acc] {
+					stickyUnbind(sessionKey)
+					break
+				}
+				if ok, _ := modelAccountAllowed(model, acc, accounts); !ok {
+					stickyUnbind(sessionKey)
+					break
+				}
+				kind, ok := usableForModelLocked(acc, model, now)
+				if !ok || windowOverLimit(acc) {
+					stickyUnbind(sessionKey)
+					break
+				}
+				if kind == selectionProbeExhausted {
+					modelStateLocked(acc, model).NextProbeAt = now.Add(modelProbeDelay)
+				}
+				stickyBind(sessionKey, acc.Path, now)
+				bumpWeight(acc)
+				return acc, kind, nil
+			}
+		}
+	}
+
+	// pick 在同一优先级内按「加权虚拟完成时间」选号（weighted round-robin）：
+	// 权重取账号月积分总量（付费 7000 / 免费 3000），所以付费号吃到的请求
+	// 约为免费号的 7/3 倍，而不是五个号平均分。同权重时退化为原来的轮询。
+	pick := func(siteFilter func(string) bool, skipOverLimit bool) (*Account, accountSelectionKind, bool) {
 		for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
+			var best *Account
+			bestKind := wanted
+			var bestScore float64
 			for i := 0; i < len(accounts); i++ {
 				idx := (rrIndex + i) % len(accounts)
 				acc := accounts[idx]
@@ -1413,27 +1457,95 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 				if siteFilter != nil && !siteFilter(accSiteLocked(acc)) {
 					continue
 				}
+				if skipOverLimit && windowOverLimit(acc) {
+					continue
+				}
 				kind, ok := usableForModelLocked(acc, model, now)
 				if !ok || kind != wanted {
 					continue
 				}
-				if kind == selectionProbeExhausted {
-					modelStateLocked(acc, model).NextProbeAt = now.Add(modelProbeDelay)
+				score := weightScore(acc.Path, accountWeight(acc))
+				if best == nil || score < bestScore {
+					best, bestKind, bestScore = acc, kind, score
 				}
-				rrIndex = (idx + 1) % len(accounts)
-				return acc, kind, true
 			}
+			if best == nil {
+				continue
+			}
+			if bestKind == selectionProbeExhausted {
+				modelStateLocked(best, model).NextProbeAt = now.Add(modelProbeDelay)
+			}
+			for i, acc := range accounts {
+				if acc == best {
+					rrIndex = (i + 1) % len(accounts)
+					break
+				}
+			}
+			bumpWeight(best)
+			return best, bestKind, true
 		}
 		return nil, "", false
 	}
 
 	if len(preferred) > 0 {
-		if acc, kind, ok := pick(func(site string) bool { return preferred[site] }); ok {
+		if acc, kind, ok := pick(func(site string) bool { return preferred[site] }, true); ok {
+			stickyBind(sessionKey, acc.Path, now)
 			return acc, kind, nil
 		}
-		log.Printf("[FreeSite] 模型 %s 的免费站点账号当前均不可用，回退到其余站点代偿", model)
+		// 免费站点（国际站）跑满 48h 软限后不再硬撑，直接切到其余站点（国内站付费号）
+		// 继续服务 —— 让免费额度吃到软线为止，再用付费积分兜底。
+		log.Printf("[FreeSite] 模型 %s 的免费站点账号已全部越过 48h 软线或不可用，切换到其余站点代偿", model)
 	}
-	if acc, kind, ok := pick(nil); ok {
+	if acc, kind, ok := pick(nil, true); ok {
+		stickyBind(sessionKey, acc.Path, now)
+		return acc, kind, nil
+	}
+	// 全部账号都已越过 48h 软线时的保底选号：按窗口余量最大者挑。
+	// 不继续按积分权重挑，是因为权重高的账号通常也最接近硬墙，
+	// 先把它吃穿会让随后的冷却时间最长。
+	pickMostHeadroom := func() (*Account, accountSelectionKind, bool) {
+		var best *Account
+		bestKind := accountSelectionKind("")
+		var bestHeadroom int64
+		for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
+			for _, acc := range accounts {
+				if attempted != nil && attempted[acc] {
+					continue
+				}
+				if ok, _ := modelAccountAllowed(model, acc, accounts); !ok {
+					continue
+				}
+				kind, ok := usableForModelLocked(acc, model, now)
+				if !ok || kind != wanted {
+					continue
+				}
+				headroom := windowHeadroom(acc)
+				if best == nil || headroom > bestHeadroom {
+					best, bestKind, bestHeadroom = acc, kind, headroom
+				}
+			}
+			if best != nil {
+				break
+			}
+		}
+		if best == nil {
+			return nil, "", false
+		}
+		if bestKind == selectionProbeExhausted {
+			modelStateLocked(best, model).NextProbeAt = now.Add(modelProbeDelay)
+		}
+		bumpWeight(best)
+		return best, bestKind, true
+	}
+
+	// 全部账号都已越过 48h 软线时不能直接失败，否则模型会整段不可用。
+	// 此时按「窗口余量最大者优先」回退，而不是继续按积分权重挑：
+	// 权重高的账号通常也最接近硬墙，先把它吃穿会让冷却时间最长。
+	if acc, kind, ok := pickMostHeadroom(); ok {
+		total, limit := accountWindowUsage(acc)
+		log.Printf("[TokenWindow] 模型 %s 全部账号均已越过 48h 软线，回退使用余量最大的 %s（窗口内=%d 阈值=%d）",
+			model, filepath.Base(acc.Path), total, limit)
+		stickyBind(sessionKey, acc.Path, now)
 		return acc, kind, nil
 	}
 
@@ -1480,7 +1592,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 }
 
 func nextAccount() (*Account, error) {
-	acc, _, err := nextAccountForModel("", nil)
+	acc, _, err := nextAccountForModel("", nil, "")
 	return acc, err
 }
 
@@ -3314,6 +3426,12 @@ func runServe() {
 
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
+	// 会话粘性（session affinity）与账号级 48h 滚动 token 软限：必须在 loadAccounts 之后
+	// 初始化，因为窗口落盘文件放在凭据目录下。
+	initTokenWindow()
+	initSticky()
+	go tokenWindowGC()
+	go stickyGC()
 	// 主动续期（保活）：到点刷新全部账号登录凭据，不等访问令牌临近过期
 	go keepaliveLoop()
 	go backgroundQuotaRefresher()
@@ -3624,6 +3742,8 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	traceID := w.Header().Get("X-Trace-ID")
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
+	// 会话粘性键：从请求体派生，让同一会话固定走同一账号，上游前缀缓存持续命中。
+	sessionKey := sessionKeyFromBody(upstreamBytes)
 	accountMu.Lock()
 	poolSize := len(accounts)
 	accountMu.Unlock()
@@ -3642,7 +3762,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	var lastAuthErr string
 	attempted := make(map[*Account]bool, poolSize)
 	for attempt := 0; attempt < poolSize; attempt++ {
-		acc, selection, err := nextAccountForModel(modelName, attempted)
+		acc, selection, err := nextAccountForModel(modelName, attempted, sessionKey)
 		if err != nil {
 			if errors.Is(err, errModelAccountPolicy) {
 				log.Printf("[请求被拒绝] traceId=%s requestId=%d 模型=%s 原因=账号黑白名单没有匹配的凭据 返回状态码=403 业务影响=未进入上游", traceID, reqID, modelName)
@@ -4096,6 +4216,7 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 		observeModelCredit(acc, modelName, usage, reqID)
 		statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 		recordModelTokens(modelName, usage, reqID)
+		recordAccountTokens(acc, tokenCountOf(usage))
 		recordModelLatency(modelName, time.Since(startTime))
 		if scanErr == nil && finishReason != "" {
 			log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
@@ -4123,6 +4244,7 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	statsObserveUsage(r, usage, true)
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
+	recordAccountTokens(acc, tokenCountOf(usage))
 	recordModelLatency(modelName, time.Since(startTime))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

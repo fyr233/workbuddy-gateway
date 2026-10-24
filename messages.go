@@ -945,6 +945,7 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 	observeModelCredit(acc, modelName, state.usage, reqID)
 	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
+	recordAccountTokens(acc, tokenCountOf(state.usage))
 	recordModelLatency(modelName, time.Since(startTime))
 	debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
 	log.Printf("[响应完成] traceId=%s requestId=%d Messages流式输出完成 账号=%s 站点=%s 耗时=%v 首Token(v2)=%s", debugTraceID(r), reqID, acc.Path, prof.Label, time.Since(startTime), body.text())
@@ -977,6 +978,7 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 	observeModelCredit(acc, modelName, state.usage, reqID)
 	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
+	recordAccountTokens(acc, tokenCountOf(state.usage))
 	recordModelLatency(modelName, time.Since(startTime))
 	out, err := json.Marshal(msg)
 	if err != nil {
