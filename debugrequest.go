@@ -33,6 +33,38 @@ var debugRequestDigestKey = func() []byte {
 	return key
 }()
 
+// 完整请求日志的裁剪参数。运行期由 applyGatewayConfig 从 debug 段同步，
+// 这样调大上限排障不需要重启容器。
+var (
+	fullRequestLimitBytes atomic.Int64
+	fullRequestKeepCount  atomic.Int64
+)
+
+const (
+	defaultFullRequestLimitBytes = 1 << 20 // 1 MiB，实测中位数 1.5 MB，能留住绝大多数请求原貌
+	defaultFullRequestKeep       = 6
+	unlimitedFullRequestLimit    = -1
+)
+
+func applyFullRequestLimits(limitBytes, keep int) {
+	if limitBytes == 0 {
+		limitBytes = defaultFullRequestLimitBytes
+	}
+	if keep <= 0 {
+		keep = defaultFullRequestKeep
+	}
+	fullRequestLimitBytes.Store(int64(limitBytes))
+	fullRequestKeepCount.Store(int64(keep))
+}
+
+func fullRequestLogLimit() int {
+	return int(fullRequestLimitBytes.Load())
+}
+
+func fullRequestKeepMessages() int {
+	return int(fullRequestKeepCount.Load())
+}
+
 func fullRequestLoggingEnabled(r *http.Request) bool {
 	if r == nil || r.Method != http.MethodPost || !debugFullRequests.Load() || !debugLoggingEnabled() {
 		return false

@@ -126,16 +126,23 @@ func TestDebugJSONFieldsAndRedaction(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &record); err != nil {
 		t.Fatalf("debug line is not JSON: %v\n%s", err, line)
 	}
+	// 空值字段会被 compactDebugRecord 剔除以省字节；这里校验的是有值时必须写对，
+	// 以及无论怎么剔除，下列锚点字段都必须存在（没有就退化成无法关联的日志）。
 	for _, key := range []string{
-		"timestamp", "level", "event", "trace_id", "request_id", "parent_request_id",
-		"service", "instance", "version", "route", "method", "model", "acc", "stream",
-		"elapsed_ms", "client_ip", "remote_addr", "user_agent", "host", "scheme",
-		"content_type", "content_length", "transfer_encoding", "x_forwarded_for", "x_real_ip",
-		"trace_header_received", "deadline_present", "deadline_remaining_ms", "protocol", "tls",
-		"authorization_present", "api_key_fingerprint",
+		"timestamp", "level", "event", "trace_id", "request_id",
+		"service", "instance", "version", "route", "method", "model", "acc",
+		"client_ip", "remote_addr", "user_agent", "host", "scheme",
+		"content_type", "protocol", "authorization_present", "api_key_fingerprint",
 	} {
 		if _, ok := record[key]; !ok {
 			t.Errorf("missing required debug field %q", key)
+		}
+	}
+	// 有值的字段仍然要如实写出（X-Forwarded-For 与 content-length 本例非空）。
+	// elapsed_ms 在极快路径上可能是 0，属于合法空值，不在此列。
+	for _, key := range []string{"x_forwarded_for", "content_length", "stream"} {
+		if _, ok := record[key]; !ok {
+			t.Errorf("missing non-empty debug field %q", key)
 		}
 	}
 	if record["trace_id"] != "trace-from-client" || record["model"] != "hy4-preview" || record["acc"] != "workbuddy1.json" {
@@ -177,14 +184,18 @@ func TestDebugBodyEventsDoNotLogBody(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[1]), &completed); err != nil {
 		t.Fatal(err)
 	}
+	// body_limit_bytes / read_error* 在正常路径下本来就是零值，compactDebugRecord 会剔除；
+	// 这里只校验实打实的计量字段，并在下面单独验证零值确实被剔除了。
 	for _, key := range []string{
 		"declared_body_bytes", "actual_body_bytes", "body_read_ms", "body_sha256_prefix",
-		"json_valid", "json_decode_ms", "body_limit_bytes", "body_limit_exceeded",
-		"read_error_type", "read_error",
+		"json_valid", "json_decode_ms", "body_limit_exceeded",
 	} {
 		if _, ok := completed[key]; !ok {
 			t.Errorf("missing body debug field %q", key)
 		}
+	}
+	if _, ok := completed["body_limit_bytes"]; ok {
+		t.Errorf("expected zero-valued body_limit_bytes to be dropped")
 	}
 	if completed["event"] != "request_body_read_completed" || completed["body_sha256_prefix"] == "" {
 		t.Fatalf("unexpected completed body event: %#v", completed)

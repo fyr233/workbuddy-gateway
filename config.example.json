@@ -27,7 +27,9 @@
   },
   "debug": {
     "enabled": false,
-    "fullRequests": false
+    "fullRequests": false,
+    "fullRequestLimitBytes": 1048576,
+    "fullRequestKeepMessages": 6
   },
   "logs": {
     "retentionDays": 0

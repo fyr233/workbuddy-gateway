@@ -16,10 +16,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -114,6 +116,11 @@ type runtimeFileConfig struct {
 type debugFileConfig struct {
 	Enabled      bool `json:"enabled"`
 	FullRequests bool `json:"fullRequests"`
+	// FullRequestLimitBytes：单条完整请求日志的 body 体积上限，超出即裁剪。
+	// 0 表示使用默认 1 MiB；负数表示不裁剪（排障时临时要全量）。
+	FullRequestLimitBytes int `json:"fullRequestLimitBytes"`
+	// FullRequestKeepMessages：裁剪时 messages 首尾各保留的条数，0 取默认 6。
+	FullRequestKeepMessages int `json:"fullRequestKeepMessages"`
 }
 
 func (d *debugFileConfig) UnmarshalJSON(data []byte) error {
@@ -128,6 +135,8 @@ func (d *debugFileConfig) UnmarshalJSON(data []byte) error {
 	}
 	d.Enabled = tolerantConfigBool(object["enabled"])
 	d.FullRequests = tolerantConfigBool(object["fullRequests"])
+	d.FullRequestLimitBytes = tolerantConfigInt(object["fullRequestLimitBytes"], 0)
+	d.FullRequestKeepMessages = tolerantConfigInt(object["fullRequestKeepMessages"], 0)
 	return nil
 }
 
@@ -156,6 +165,24 @@ func tolerantConfigBool(raw json.RawMessage) bool {
 	return false
 }
 
+func tolerantConfigInt(raw json.RawMessage, fallback int) int {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) || bytes.Equal(raw, []byte(`""`)) {
+		return fallback
+	}
+	var number int
+	if json.Unmarshal(raw, &number) == nil {
+		return number
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(text)); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
 type modelAccountFileConfig struct {
 	Allowlist []string `json:"allowlist"`
 	Blocklist []string `json:"blocklist"`
@@ -181,6 +208,206 @@ type debugJSONSink struct {
 	mu     sync.Mutex
 	writer io.Writer
 	closer io.Closer
+}
+
+// debugRecordWriter 在写入前做两件压缩：剔除空值字段、为超大完整请求按体积上限截断。
+// 实测 debug-*.jsonl 中 99% 的字节来自不足 1% 的超大行（单条最高 15 MB），
+// 而公共字段里有一半恒为空（acc/model/x_forwarded_for/tls…），逐条写出去只是噪声。
+//
+// 空值不写：只保留有信息量的键。bool 一律保留——false 本身带语义
+// （headers_written=false 表示上游没吐头），删掉就分不清"没发生"和"没记录"。
+func debugFieldEmpty(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return x == ""
+	case int64:
+		return x == 0
+	case float64:
+		return x == 0
+	case json.Number:
+		return x == "0" || x == ""
+	case []any:
+		return len(x) == 0
+	case map[string]any:
+		return len(x) == 0
+	}
+	return false
+}
+
+func compactDebugRecord(record map[string]any) map[string]any {
+	out := make(map[string]any, len(record))
+	for k, v := range record {
+		if debugFieldEmpty(v) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// 截断标记字段，便于事后判断哪些请求被裁剪过。放在 body 内层，避免污染公共字段。
+const (
+	debugTruncatedSentinel = "[日志裁剪]"
+	debugMessagesKeptKey   = "messages_kept"
+	debugMessagesOmitted   = "messages_omitted"
+	debugToolsTotalKey     = "tools_total"
+	debugOriginalBytesKey  = "body_original_bytes"
+)
+
+// truncateFullRequestBody 只在超限时改写日志副本：保留全部非 messages 字段，
+// messages 只留首尾各 keep 条，中间用一条标记消息代替。原始体积写进 body 供事后核对。
+// 传入的 body 是 redact 后的日志副本，业务侧读的是 raw，不受影响。
+//
+// 迭代收缩：先按 keep 条数裁剪，仍超限就减半 keep 并收紧单条字符串上限，
+// 直到装进 limit 或退到"只留首尾各 1 条 + 各 4 KB"，保证单条日志不会撑爆磁盘。
+func truncateFullRequestBody(fields map[string]any, limit, keep int) map[string]any {
+	if limit <= 0 {
+		return fields
+	}
+	body, ok := fields["body"].(map[string]any)
+	if !ok {
+		return fields
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil || len(encoded) <= limit {
+		return fields
+	}
+	if keep < 1 {
+		keep = 6
+	}
+	stringCap := 64 << 10
+	var out map[string]any
+	for attempt := 0; ; attempt++ {
+		out = buildTruncatedBody(body, keep, stringCap)
+		probe, marshalErr := json.Marshal(out)
+		if marshalErr == nil && len(probe) <= limit {
+			break
+		}
+		if keep == 1 && stringCap <= 4<<10 {
+			break // 已到最小形态，接受结果。
+		}
+		if keep > 1 {
+			keep /= 2
+			if keep < 1 {
+				keep = 1
+			}
+		}
+		if stringCap > 4<<10 {
+			stringCap /= 4
+		}
+	}
+	out[debugOriginalBytesKey] = len(encoded)
+	result := make(map[string]any, len(fields))
+	for k, v := range fields {
+		result[k] = v
+	}
+	result["body"] = out
+	return result
+}
+
+func buildTruncatedBody(body map[string]any, keep, stringCap int) map[string]any {
+	out := make(map[string]any, len(body)+2)
+	totalMessages := 0
+	for k, v := range body {
+		switch k {
+		case "messages", "input":
+			items, isSlice := v.([]any)
+			if !isSlice {
+				out[k] = v
+				continue
+			}
+			totalMessages = len(items)
+			if len(items) > 2*keep {
+				out[k] = elideDebugMessages(items, keep, len(items)-2*keep, stringCap)
+				out[debugMessagesKeptKey], out[debugMessagesOmitted] = 2*keep, len(items)-2*keep
+				continue
+			}
+			shrunk := make([]any, 0, len(items))
+			for _, item := range items {
+				shrunk = append(shrunk, shrinkDebugMessage(item, stringCap))
+			}
+			out[k] = shrunk
+		case "tools":
+			list, isSlice := v.([]any)
+			// 工具定义体积大但结构关键：留前 40 个并标注总数。
+			if isSlice && len(list) > 40 {
+				out[k] = list[:40]
+				out[debugToolsTotalKey] = len(list)
+			} else {
+				out[k] = v
+			}
+		default:
+			out[k] = v
+		}
+	}
+	if totalMessages > 0 {
+		out["messages_total"] = totalMessages
+	}
+	return out
+}
+
+// elideDebugMessages 保留首尾各 keep 条，中间插一条标记消息。
+// 头部通常是 system 与本轮上下文起点，尾部是当前轮对话，中间纯历史可丢。
+func elideDebugMessages(items []any, keep, elided, stringCap int) []any {
+	out := make([]any, 0, 2*keep+1)
+	for _, item := range items[:keep] {
+		out = append(out, shrinkDebugMessage(item, stringCap))
+	}
+	out = append(out, map[string]any{
+		"role":    "system",
+		"content": fmt.Sprintf("%s 中间 %d 条消息已省略，原始体积见 body_original_bytes", debugTruncatedSentinel, elided),
+	})
+	for _, item := range items[len(items)-keep:] {
+		out = append(out, shrinkDebugMessage(item, stringCap))
+	}
+	return out
+}
+
+// shrinkDebugMessage 对单条消息里超长的文本做截断。部分客户端会把整份代码库
+// 塞进一条 system 或 tool 结果里，单条就能到几百 KB；保留开头和结尾足够判断指纹。
+// 截断按 UTF-8 边界回退，避免把汉字劈成替换字符。
+func shrinkDebugMessage(item any, limit int) any {
+	message, ok := item.(map[string]any)
+	if !ok || limit <= 0 {
+		return item
+	}
+	out := make(map[string]any, len(message)+1)
+	for k, v := range message {
+		text, isText := v.(string)
+		if isText && len(text) > limit {
+			head, tail := headTailRunes(text, limit/4)
+			out[k] = fmt.Sprintf("%s（单条内容 %d 字节，仅保留首尾各 %d 字节）\n%s\n…\n%s",
+				debugTruncatedSentinel, len(text), limit/4, head, tail)
+			out["content_truncated_bytes"] = len(text)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// headTailRunes 在 UTF-8 字符边界上取首尾各 n 字节。
+func headTailRunes(text string, n int) (string, string) {
+	if n <= 0 {
+		return "", ""
+	}
+	headEnd := n
+	if headEnd > len(text) {
+		headEnd = len(text)
+	}
+	for headEnd > 0 && !utf8.RuneStart(text[headEnd]) {
+		headEnd--
+	}
+	tailStart := len(text) - n
+	if tailStart < headEnd {
+		tailStart = headEnd
+	}
+	for tailStart < len(text) && !utf8.RuneStart(text[tailStart]) {
+		tailStart++
+	}
+	return text[:headEnd], text[tailStart:]
 }
 
 var (
@@ -577,6 +804,10 @@ func debugEvent(r *http.Request, level, event string, fields map[string]any) {
 	}
 
 	// 只生成日志用副本，不能改写调用方用于业务判断的字段或错误。
+	record = compactDebugRecord(record)
+	if strings.HasPrefix(event, "full_request_") {
+		record = truncateFullRequestBody(record, fullRequestLogLimit(), fullRequestKeepMessages())
+	}
 	data, err := json.Marshal(redactDebugValue(record))
 	if err != nil {
 		return

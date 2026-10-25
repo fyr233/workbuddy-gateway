@@ -1,14 +1,17 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +28,7 @@ var lastLogCleanup struct {
 }
 
 // 写入时按本地日期切换文件。与清理共用打开文件登记，不能删除正在写入的旧日志。
+// 跨天时把上一天的日志后台 gzip 压缩：jsonl 压缩比约 30:1，日 1 GB 量级不压很快吃满盘。
 type dailyLogWriter struct {
 	mu                sync.Mutex
 	prefix, extension string
@@ -38,6 +42,7 @@ func newDailyLogWriter(prefix, extension string) (*dailyLogWriter, error) {
 	if err := w.rotate(time.Now()); err != nil {
 		return nil, err
 	}
+	go compressRotatedLogsOnStart()
 	return w, nil
 }
 
@@ -60,6 +65,7 @@ func (w *dailyLogWriter) rotate(now time.Time) error {
 		return err
 	}
 	activeLogs[path]++
+	previousPath := w.path
 	if w.file != nil {
 		_ = w.file.Close()
 		activeLogs[w.path]--
@@ -68,6 +74,10 @@ func (w *dailyLogWriter) rotate(now time.Time) error {
 		}
 	}
 	w.file, w.path, w.day = f, path, day
+	if previousPath != "" {
+		// 旧文件已关闭且不再登记，可以安全压缩。
+		go compressLogFile(previousPath)
+	}
 	return nil
 }
 
@@ -99,8 +109,95 @@ func (w *dailyLogWriter) Close() error {
 	return w.file.Close()
 }
 
-var managedLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl|deployment-\d{4}-\d{2}-\d{2}\.jsonl|frontend-\d{4}-\d{2}-\d{2}\.log)$`)
+var managedLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl|deployment-\d{4}-\d{2}-\d{2}\.jsonl|frontend-\d{4}-\d{2}-\d{2}\.log)(\.gz)?$`)
 var logDatePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
+var compressibleLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl|deployment-\d{4}-\d{2}-\d{2}\.jsonl|frontend-\d{4}-\d{2}-\d{2}\.log)$`)
+
+// compressLogFile 把 plain 原地压成 plain.gz，保留原文件权限。
+// 只压缩已关闭的历史文件；正在写入的文件在 activeLogs 里有登记，这里会直接跳过。
+// 先写 .gz.tmp 再 rename，中途失败不会留下半个 .gz 覆盖掉原始数据。
+func compressLogFile(path string) {
+	if !compressibleLogPattern.MatchString(filepath.Base(path)) {
+		return
+	}
+	activeLogsMu.Lock()
+	if activeLogs[path] > 0 {
+		activeLogsMu.Unlock()
+		return
+	}
+	activeLogsMu.Unlock()
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	src, err := os.Open(path)
+	if err != nil {
+		log.Printf("[日志压缩] 文件=%q 结果=跳过 原因=%s", filepath.Base(path), safeDebugError(err))
+		return
+	}
+	defer src.Close()
+	tmp := path + ".gz.tmp"
+	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("[日志压缩] 文件=%q 结果=跳过 原因=%s", filepath.Base(path), safeDebugError(err))
+		return
+	}
+	zw := gzip.NewWriter(dst)
+	zw.Name = filepath.Base(path)
+	written, copyErr := io.Copy(zw, src)
+	if copyErr == nil {
+		copyErr = zw.Close()
+	} else {
+		_ = zw.Close()
+	}
+	if closeErr := dst.Close(); copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		log.Printf("[日志压缩] 文件=%q 结果=失败 原因=%s 说明=保留原始日志", filepath.Base(path), safeDebugError(copyErr))
+		return
+	}
+	if err := os.Rename(tmp, path+".gz"); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("[日志压缩] 文件=%q 结果=失败 原因=%s", filepath.Base(path), safeDebugError(err))
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		// 压缩副本已就位，原文件删不掉只是多占空间，不重试删除以免误伤。
+		log.Printf("[日志压缩] 文件=%q 结果=部分成功 说明=压缩完成但原文件未删除 原因=%s", filepath.Base(path), safeDebugError(err))
+		return
+	}
+	info, _ := os.Stat(path + ".gz")
+	size := int64(0)
+	if info != nil {
+		size = info.Size()
+	}
+	log.Printf("[日志压缩] 文件=%q 原始字节=%d 压缩后字节=%d 结果=完成", filepath.Base(path), written, size)
+}
+
+// compressRotatedLogsOnStart 在启动时扫一遍目录，把漏压的历史日志补压。
+// 只处理昨天然及更早的文件，当天正在写的永远跳过。
+func compressRotatedLogsOnStart() {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return
+	}
+	today := time.Now().Format("2006-01-02")
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || !compressibleLogPattern.MatchString(name) {
+			continue
+		}
+		if strings.Contains(name, today) {
+			continue
+		}
+		path, err := filepath.Abs(filepath.Join(logDir, name))
+		if err != nil {
+			continue
+		}
+		compressLogFile(path)
+	}
+}
 
 type logCleanupResult struct {
 	RetentionDays int      `json:"retentionDays"`
