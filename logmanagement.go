@@ -116,10 +116,15 @@ var compressibleLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.lo
 // compressLogFile 把 plain 原地压成 plain.gz，保留原文件权限。
 // 只压缩已关闭的历史文件；正在写入的文件在 activeLogs 里有登记，这里会直接跳过。
 // 先写 .gz.tmp 再 rename，中途失败不会留下半个 .gz 覆盖掉原始数据。
+//
+// 与 cleanupLogs 共用 logCleanupMu：否则压缩改名与保留期删除会竞争同一路径，
+// 出现"压缩完成但清理统计为 0"或反之。持锁期间只做一次流式压缩，不阻塞请求路径。
 func compressLogFile(path string) {
 	if !compressibleLogPattern.MatchString(filepath.Base(path)) {
 		return
 	}
+	logCleanupMu.Lock()
+	defer logCleanupMu.Unlock()
 	activeLogsMu.Lock()
 	if activeLogs[path] > 0 {
 		activeLogsMu.Unlock()
