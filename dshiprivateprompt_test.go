@@ -500,6 +500,10 @@ func TestHermesPrivatePromptRealFixture(t *testing.T) {
 	setDSHPrivatePromptConfig(nil, "蓝色大肥鱼")
 	t.Cleanup(func() { setDSHPrivatePromptConfig(nil, "") })
 	out, _ := rewriteHermesSystemText(string(raw))
+	// 技能索引与 MEMORY 属用户/插件内容，按现有边界不动；断言只看运行时模板段。
+	if i, j := strings.Index(out, "<available_skills>"), strings.Index(out, "</available_skills>"); i >= 0 && j > i {
+		out = out[:i] + out[j+len("</available_skills>"):]
+	}
 	for _, bad := range []string{"Hermes Agent", "Nous Research", "nousresearch.com", "Hermes runtime environment", "Mid-turn user steering", "Active Hermes profile"} {
 		if strings.Contains(out, bad) {
 			t.Fatalf("真实样本残留 %q", bad)
