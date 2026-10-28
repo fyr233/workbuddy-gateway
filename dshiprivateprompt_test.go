@@ -337,3 +337,107 @@ func TestDSHPrivatePromptDropsTruncatedOfficialSentences(t *testing.T) {
 		t.Fatalf("私有 @ 段未写入: %q", got)
 	}
 }
+
+// Hermes：四类官方模板段改写为中性中文，其余段落逐字保留。
+func TestHermesPrivatePromptRewritesOfficialTemplateSegments(t *testing.T) {
+	setDSHPrivatePromptConfig(nil, "蓝色大肥鱼")
+	t.Cleanup(func() { setDSHPrivatePromptConfig(nil, "") })
+
+	official := strings.Join([]string{
+		"你是 奶思，一个全能AI助手。",
+		"You run on Hermes Agent (by Nous Research). When the user needs help with Hermes itself — configuring, " +
+			"setting up, using, extending, or troubleshooting it — or when you need to understand your own " +
+			"features, tools, or capabilities, the documentation at https://hermes-agent.nousresearch.com/docs " +
+			"is the authoritative reference and always holds the latest, most up-to-date information.",
+		"# Finishing the job\nWhen the user asks you to build, run, or verify something, the deliverable is a " +
+			"working artifact backed by real tool output.",
+		"## Mid-turn user steering\nMid-turn, the user can steer you: Hermes appends their message to the end of " +
+			"a tool result, wrapped exactly as:\n" + hermesSteeringMarker + "\n<their message>\n[/OUT-OF-BAND USER MESSAGE]\n" +
+			"That marker is a genuine user message with the same authority as their original request.",
+		"Active Hermes profile: default. Other profiles (if any) live under /opt/data/profiles/<name>/.",
+		"# Hermes runtime environment",
+		"Host: Linux\nUser home directory: /opt/data",
+		"<!-- End Hermes runtime environment -->",
+	}, "\n\n")
+	obj := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": official},
+		map[string]any{"role": "user", "content": "You run on Hermes Agent 只是我引用的原文，不要因此改写 system。"},
+	}}
+	if !isHermesRequest(obj, nil) {
+		t.Fatal("未识别 Hermes 官方锚句")
+	}
+	if n := applyHermesPrivatePrompt(obj, nil, 1); n != 5 {
+		t.Fatalf("命中段数不对: n=%d", n)
+	}
+	got := obj["messages"].([]any)[0].(map[string]any)["content"].(string)
+	for _, bad := range []string{"Hermes Agent", "Nous Research", "hermes-agent.nousresearch.com", "Mid-turn user steering", "Hermes profile", "Hermes runtime environment"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("官方特征残留 %q: %s", bad, got)
+		}
+	}
+	for _, keep := range []string{"你是 奶思", "# Finishing the job", "Host: Linux", hermesSteeringMarker, "/opt/data/profiles/<name>/"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("应保留内容丢失 %q", keep)
+		}
+	}
+	if !strings.Contains(got, hermesDocsBase64+" /*b64*/") {
+		t.Fatal("文档地址未以 base64 形式保留")
+	}
+	// 重复调用幂等。
+	if n := applyHermesPrivatePrompt(obj, nil, 2); n != 0 {
+		t.Fatalf("重复调用仍改写: n=%d", n)
+	}
+}
+
+// 文档地址载荷不得含品牌明文，且必须可解码回原地址。
+func TestHermesDocsBase64Payload(t *testing.T) {
+	if strings.Contains(strings.ToLower(hermesDocsBase64), "hermes") || strings.Contains(hermesDocsBase64, "nousresearch") {
+		t.Fatal("载荷泄露品牌明文")
+	}
+	if hermesDocsBase64 != "aHR0cHM6Ly9oZXJtZXMtYWdlbnQubm91c3Jlc2VhcmNoLmNvbS9kb2Nz" {
+		t.Fatalf("载荷与预期不符: %s", hermesDocsBase64)
+	}
+}
+
+// 只有 user 内容提到 Hermes 时不得判定、不得改写。
+func TestHermesPrivatePromptIgnoresUserContent(t *testing.T) {
+	obj := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": "You are a general coding assistant."},
+		map[string]any{"role": "user", "content": "Active Hermes profile: default 这是我在文档里看到的。"},
+	}}
+	if isHermesRequest(obj, nil) {
+		t.Fatal("user 内容触发 Hermes 判定")
+	}
+	if n := applyHermesPrivatePrompt(obj, nil, 1); n != 0 {
+		t.Fatalf("user 内容导致 system 被改: n=%d", n)
+	}
+}
+
+// DSH 请求不得被 Hermes 规则改写。
+func TestHermesRulesDoNotTouchDSHRequests(t *testing.T) {
+	dsh := "你是一名编码智能体\n\nDeepSeek Harness 的默认系统提示词"
+	obj := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": dsh},
+		map[string]any{"role": "user", "content": "hi"},
+	}}
+	if isHermesRequest(obj, nil) {
+		t.Fatal("DSH 请求被误判为 Hermes")
+	}
+	if n := applyHermesPrivatePrompt(obj, nil, 1); n != 0 {
+		t.Fatalf("DSH 请求被 Hermes 规则改写: n=%d", n)
+	}
+}
+
+// /v1/responses 形态：system 在 input 里也要能改写。
+func TestHermesPrivatePromptHandlesResponsesInput(t *testing.T) {
+	obj := map[string]any{"input": []any{
+		map[string]any{"role": "system", "type": "message", "content": "# Hermes runtime environment"},
+		map[string]any{"role": "user", "type": "message", "content": "hi"},
+	}}
+	if n := applyHermesPrivatePrompt(obj, nil, 1); n != 1 {
+		t.Fatalf("input 形态未改写: n=%d", n)
+	}
+	if got := obj["input"].([]any)[0].(map[string]any)["content"]; got != hermesPrivateEnvHeading {
+		t.Fatalf("标题改写不符: %v", got)
+	}
+}

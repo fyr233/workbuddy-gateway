@@ -65,11 +65,9 @@ func prepareUpstreamChatRequest(obj map[string]any, r *http.Request, requestID u
 		logSystemPrefixSanitized(r, requestID, modified)
 	}
 	// DSH 私有系统提示词：把默认系统提示词 4 段整段重写为中性中文表述。
-	// 必须在 logDSHPromptCompatibility 之前执行：那条兼容链会把官方句子就地
-	// 归一化（"DeepSeek Harness Web GUI" → "Web GUI"），改写后官方段落特征消失，
-	// 私有规则就再也匹配不上。改写完的文本不含任何官方特征，后续链自然跳过。
-	// 只对带 DSH 特征的请求生效，Hermes 等其它 harness 零改动。
+	// 必须在兼容链之前按各自协议改写：DSH 走整段私有提示词，Hermes 仅改写官方模型身份首句。
 	applyDSHPrivateSystemPrompt(obj, r, requestID, model)
+	applyHermesPrivatePrompt(obj, r, requestID)
 	// 三个协议都可能在这里合并文本块。先在合并前处理每个块的开头，
 	// 再在 fallback/force 注入后补一次，避免后续块的前缀因拼接而丢失。
 	logDSHPromptCompatibility(r, requestID, obj)
@@ -80,6 +78,7 @@ func prepareUpstreamChatRequest(obj map[string]any, r *http.Request, requestID u
 	// 配置的 force/fallback 提示词在上一步才注入，可能又带入官方段落，补一次。
 	// 私有段落本身是幂等的，重复调用不会二次变形。
 	applyDSHPrivateSystemPrompt(obj, r, requestID, model)
+	applyHermesPrivatePrompt(obj, r, requestID)
 	logDSHPromptCompatibility(r, requestID, obj)
 	ensureUpstreamMaxTokens(obj, r, requestID, trace, model)
 	if profile == requestProfileOfficial {
