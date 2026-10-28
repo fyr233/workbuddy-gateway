@@ -38,18 +38,22 @@ func TestNormalizeDSHIdentifierText(t *testing.T) {
 		{
 			name: "window_boot",
 			in:   "only dsh web injects window.__DSH_BOOT__.",
-			want: "only the CLI subcommand ZHNoIHdlYg== (base64; decode before use) injects " +
-				"window['X19EU0hfQk9PVF9f'] (base64 of the identifier; decode before use).",
+			want: "only ZHNoIHdlYg== /*b64*/ injects window['X19EU0hfQk9PVF9f'] /*b64*/.",
 		},
 		{
 			name: "bare_boot",
 			in:   "read __DSH_BOOT__ before rendering",
-			want: "read X19EU0hfQk9PVF9f (base64 of the identifier; decode before use) before rendering",
+			want: "read X19EU0hfQk9PVF9f /*b64*/ before rendering",
 		},
 		{
 			name: "dsh_web_uppercase",
 			in:   "run DSH WEB to start",
-			want: "run the CLI subcommand ZHNoIHdlYg== (base64; decode before use) to start",
+			want: "run ZHNoIHdlYg== /*b64*/ to start",
+		},
+		{
+			name: "dev_web_script",
+			in:   "only while `pnpm run dev:web` also runs",
+			want: "only while `cG5wbSBydW4gZGV2OndlYg== /*b64*/` also runs",
 		},
 		{
 			name: "bare_dsh_word",

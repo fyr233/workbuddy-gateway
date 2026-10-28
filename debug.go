@@ -73,6 +73,12 @@ type runtimeFileConfig struct {
 	SystemPrompt struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
+		// DSHPrivate 控制 DSH 私有系统提示词（把官方默认提示词整段改写为中性中文）。
+		// 省略时默认启用，身份名取 "蓝色大肥鱼"。
+		DSHPrivate *struct {
+			Enabled   *bool  `json:"enabled"`
+			AgentName string `json:"agentName"`
+		} `json:"dshPrivate"`
 	} `json:"systemPrompt"`
 	// Identity 控制 system/developer/assistant 中的展示身份替换。
 	// 省略时保持旧行为：已知 Harness 名称替换为 Assistant。

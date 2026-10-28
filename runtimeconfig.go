@@ -255,6 +255,15 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
+	if dsh := c.SystemPrompt.DSHPrivate; dsh != nil {
+		setDSHPrivatePromptConfig(dsh.Enabled, dsh.AgentName)
+	} else {
+		setDSHPrivatePromptConfig(nil, "")
+	}
+	if enabled, agentName := dshPrivatePromptSettings(); enabled {
+		log.Printf("[DSH私有提示词配置] traceId=%s 启用=%t 身份名=%s 结果=已应用 说明=仅改写带 DSH 特征的请求；官方默认提示词 4 段整段重写为中性中文，插件注入段不动，不记录提示词正文",
+			trace, enabled, agentName)
+	}
 	setIdentityConfig(c.Identity)
 	modelConcurrency.configure(c.Concurrent)
 	logConcurrentConfig(trace)

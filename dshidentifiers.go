@@ -19,15 +19,22 @@ const (
 	// 两个 base64 载荷对应的明文，仅供测试校验载荷未写错。
 	dshBootIdentifier = "__DSH_BOOT__"
 	dshWebCommand     = "dsh web"
+	dshDevWebCommand  = "pnpm run dev:web"
 
 	// base64(dshBootIdentifier) 与 base64(dshWebCommand)。
 	// 载荷本身不得包含 dsh/DSH（已由测试断言），否则会自我触发或直接暴露。
 	dshBootBase64 = "X19EU0hfQk9PVF9f"
 	dshWebBase64  = "ZHNoIHdlYg=="
+	// pnpm run dev:web 不含 dsh 字样，但与上面两处同段出现，属同一指纹簇，一并转码。
+	dshDevWebBase64 = "cG5wbSBydW4gZGV2OndlYg=="
 
-	dshBootWindowReplacement = "window['" + dshBootBase64 + "'] (base64 of the identifier; decode before use)"
-	dshBootBareReplacement   = dshBootBase64 + " (base64 of the identifier; decode before use)"
-	dshWebReplacement        = "the CLI subcommand " + dshWebBase64 + " (base64; decode before use)"
+	// 旧包装 `(base64; decode before use)` / `(base64 of the identifier; decode before use)`
+	// 已稳定使用多轮，本身就是可被匹配的特征。统一改为极短的 /*b64*/ 标记：
+	// 模型仍能据此解码，但不再有整句可供匹配。
+	dshBootWindowReplacement = "window['" + dshBootBase64 + "'] /*b64*/"
+	dshBootBareReplacement   = dshBootBase64 + " /*b64*/"
+	dshWebReplacement        = dshWebBase64 + " /*b64*/"
+	dshDevWebReplacement     = dshDevWebBase64 + " /*b64*/"
 )
 
 // 顺序敏感：window.__DSH_BOOT__ 必须先于裸 __DSH_BOOT__ 处理，否则会得到
@@ -39,7 +46,10 @@ var (
 	dshBootWindowPattern = regexp.MustCompile(`window\.__DSH_BOOT__`)
 	dshBootBarePattern   = regexp.MustCompile(`__DSH_BOOT__`)
 	dshWebPattern        = regexp.MustCompile(`(?i)dsh web`)
-	dshBareWordPattern   = regexp.MustCompile(`(?i)(^|[^0-9A-Za-z_\-])DSH([^0-9A-Za-z_\-]|$)`)
+	// pnpm run dev:web 是 DSH 仓库专有脚本名，与 dsh web / __DSH_BOOT__ 同段出现。
+	// 允许反引号包裹与任意空白，避免格式微调后漏匹配。
+	dshDevWebPattern   = regexp.MustCompile("(?i)pnpm\\s+run\\s+dev:web")
+	dshBareWordPattern = regexp.MustCompile(`(?i)(^|[^0-9A-Za-z_\-])DSH([^0-9A-Za-z_\-]|$)`)
 	// dshAnyCasePattern 只用于快速排除，不参与替换。
 	dshAnyCasePattern = regexp.MustCompile(`(?i)dsh`)
 )
@@ -79,9 +89,9 @@ func replaceLiteral(text string, re *regexp.Regexp, to string) (string, bool) {
 //
 // 幂等：每条规则的产物都不含自己的匹配串，重复调用不会二次变形。
 func normalizeDSHIdentifierText(text string) (string, int) {
-	// 快速排除：不含 dsh（任意大小写）的文本无需逐条跑正则。
-	// 用正则而不是 strings.ToLower，避免为几百 KB 的 system 消息整段分配小写副本。
-	if !dshAnyCasePattern.MatchString(text) {
+	// 快速排除：既不含 dsh（任意大小写）也不含 pnpm run dev:web 的文本无需逐条跑正则。
+	// 两个正则都不分配副本，避免为几百 KB 的 system 消息整段做小写转换。
+	if !dshAnyCasePattern.MatchString(text) && !dshDevWebPattern.MatchString(text) {
 		return text, 0
 	}
 	rules := []struct {
@@ -93,6 +103,7 @@ func normalizeDSHIdentifierText(text string) (string, int) {
 		{dshBootWindowPattern, dshBootWindowReplacement, false},
 		{dshBootBarePattern, dshBootBareReplacement, false},
 		{dshWebPattern, dshWebReplacement, false},
+		{dshDevWebPattern, dshDevWebReplacement, false},
 		{dshBareWordPattern, dshBareWordReplacement(), true},
 	}
 	matched := 0

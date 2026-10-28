@@ -146,9 +146,9 @@ func dshTestText(content any) string {
 
 func TestConfiguredDSHPromptsThroughHTTP(t *testing.T) {
 	identity := testDSHPrefix + ". config-identity-sentinel"
-	neutralIdentity := blockedSystemPromptPrefixReplacement + ". config-identity-sentinel"
+	neutralIdentity := dshTestPrivateIdentity() + " config-identity-sentinel"
 	gui := testDSHGUI + " Keep config-tail-sentinel."
-	neutralGUI := testDSHNeutralGUI() + " Keep config-tail-sentinel."
+	neutralGUI := dshTestPrivateGUI() + " Keep config-tail-sentinel."
 	user := identity + "\n\n" + gui + " private-user-sentinel"
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
 		for _, stream := range []bool{false, true} {
@@ -181,10 +181,10 @@ func TestConfiguredDSHPromptsThroughHTTP(t *testing.T) {
 							body["system"] = tc.clientSystem
 						}
 						if tc.name == "force_block" {
-							// Messages joins system blocks before appending force; the
-							// prefix rule does not apply mid-string, but the display-name
-							// replacement still removes the harness brand.
-							want = "Client instruction.\n\n" + strings.ReplaceAll(identity, "DeepSeek Harness", "WorkBuddy") + "\n\n" + neutralGUI
+							// Messages 把 system 块与 force 拼成一条字符串，
+							// 官方句段不在串首；私有提示词规则定位到句段起点后整段重写，
+							// 其前的客户端内容逐字保留。
+							want = "Client instruction.\n\n" + neutralIdentity + "\n\n" + neutralGUI
 						}
 					}
 					raw, err := json.Marshal(body)
@@ -204,6 +204,8 @@ func TestConfiguredDSHPromptsThroughHTTP(t *testing.T) {
 func TestDSHHistoryThroughHTTP(t *testing.T) {
 	identity := testDSHPrefix + ". Preserve history-tail-sentinel."
 	neutralIdentity := blockedSystemPromptPrefixReplacement + ". Preserve history-tail-sentinel."
+	// 历史 system/assistant 不属于默认系统提示词的 4 段（首段是 "Answer briefly."），
+	// 私有提示词规则不介入；这里沿用旧的身份替换与 GUI 归一化期望。
 	gui := "Previous context: " + testDSHGUI + " Keep custom GUI instructions."
 	neutralGUI := "Previous context: " + testDSHNeutralGUI() + " Keep custom GUI instructions."
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
@@ -217,7 +219,9 @@ func TestDSHHistoryThroughHTTP(t *testing.T) {
 					if blocks {
 						system = []any{map[string]any{"type": "text", "text": "Answer briefly."}, map[string]any{"type": "text", "text": identity}}
 						assistant = []any{map[string]any{"type": "text", "text": "Earlier part."}, map[string]any{"type": "text", "text": identity}}
-						wantSystem += "\n" + neutralIdentity
+						// system 的第二个块是完整的 DSH 身份句，私有提示词规则整句重写；
+						// assistant 的块不在默认系统提示词范围内，只走旧的身份品牌替换。
+						wantSystem += "\n" + dshTestPrivateIdentity() + " Preserve history-tail-sentinel."
 						wantAssistant = "Earlier part.\n" + neutralIdentity
 					}
 					messages := []any{

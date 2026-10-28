@@ -59,6 +59,11 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	}
 	exampleSchema := runtimeFileConfig{}
 	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
+	dshPrivateEnabled := true
+	exampleSchema.SystemPrompt.DSHPrivate = &struct {
+		Enabled   *bool  `json:"enabled"`
+		AgentName string `json:"agentName"`
+	}{Enabled: &dshPrivateEnabled, AgentName: "蓝色大肥鱼"}
 	identityEnabled := true
 	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy", Replacements: map[string]string{
 		"Claude Code": "WorkBuddy", "Claude": "WorkBuddy", "DeepSeek Harness": "WorkBuddy",

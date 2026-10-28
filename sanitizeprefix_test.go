@@ -143,7 +143,9 @@ func TestPrefixSanitizedOnAllProtocolEntrypoints(t *testing.T) {
 					break
 				}
 			}
-			if !strings.HasPrefix(system, blockedSystemPromptPrefixReplacement) ||
+			// 默认系统提示词已整段重写为私有中文段落，句尾追加内容保留。
+			if !strings.Contains(system, "一名编码智能体，底层模型为") ||
+				strings.Contains(system, "DeepSeek Harness") ||
 				!strings.Contains(system, "Keep this system.") {
 				t.Fatalf("upstream system not sanitized: %q", system)
 			}
