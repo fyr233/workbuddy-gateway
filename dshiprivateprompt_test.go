@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 )
@@ -440,4 +441,69 @@ func TestHermesPrivatePromptHandlesResponsesInput(t *testing.T) {
 	if got := obj["input"].([]any)[0].(map[string]any)["content"]; got != hermesPrivateEnvHeading {
 		t.Fatalf("标题改写不符: %v", got)
 	}
+}
+
+// 0.22.x 新增的默认人格段与新的干预投递措辞都要覆盖，品牌短语也要归零。
+func TestHermesPrivatePromptCoversNewerTemplate(t *testing.T) {
+	setDSHPrivatePromptConfig(nil, "蓝色大肥鱼")
+	t.Cleanup(func() { setDSHPrivatePromptConfig(nil, "") })
+
+	official := strings.Join([]string{
+		"You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask.",
+		"You run on Hermes Agent (by Nous Research). When the user needs help with Hermes itself — configuring, " +
+			"setting up, using, extending, or troubleshooting it, the documentation at " +
+			"https://hermes-agent.nousresearch.com/docs is your authoritative reference. The `hermes-agent` skill has " +
+			"the actual commands — load it with skill_view(name='hermes-agent') before troubleshooting Hermes.",
+		"## Mid-turn user steering\nMid-turn, the user can steer you: Hermes delivers their message as a standalone " +
+			"user message right after the latest tool results, wrapped exactly as:\n" + hermesSteeringMarker +
+			"\n<their message>\n[/OUT-OF-BAND USER MESSAGE]\nThat marker is a genuine user message.",
+		"Active Hermes profile: work. This session reads and writes /opt/data/profiles/work/. The default profile's " +
+			"data lives elsewhere.",
+		"Use native tools, and prefer `$LOCALAPPDATA/Temp` (or `$TMPDIR`, which Hermes points at its own scratch dir) " +
+			"for scratch files a native tool must read — never a bare `/tmp`.",
+		"# Hermes runtime environment",
+		"<!-- End Hermes runtime environment -->",
+	}, "\n\n")
+	obj := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": official},
+		map[string]any{"role": "user", "content": "hi"},
+	}}
+	if n := applyHermesPrivatePrompt(obj, nil, 7); n != 7 {
+		t.Fatalf("命中段数不对: n=%d", n)
+	}
+	got := obj["messages"].([]any)[0].(map[string]any)["content"].(string)
+	for _, bad := range []string{"Hermes Agent", "Nous Research", "nousresearch", "Hermes runtime", "hermes-agent", "Hermes points"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("残留官方特征 %q: %s", bad, got)
+		}
+	}
+	for _, keep := range []string{"本会话读写的目录为 /opt/data/profiles/work/", "紧跟在最新一条工具结果之后", "scratch dir", "/tmp"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("应保留内容丢失 %q", keep)
+		}
+	}
+	if n := applyHermesPrivatePrompt(obj, nil, 8); n != 0 {
+		t.Fatalf("重复调用仍改写: n=%d", n)
+	}
+}
+
+// 真实系统提示词样本（不入库，通过环境变量提供）：改写后不得残留任何官方品牌串。
+func TestHermesPrivatePromptRealFixture(t *testing.T) {
+	path := os.Getenv("HERMES_PROMPT_FIXTURE")
+	if path == "" {
+		t.Skip("未提供 HERMES_PROMPT_FIXTURE")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setDSHPrivatePromptConfig(nil, "蓝色大肥鱼")
+	t.Cleanup(func() { setDSHPrivatePromptConfig(nil, "") })
+	out, _ := rewriteHermesSystemText(string(raw))
+	for _, bad := range []string{"Hermes Agent", "Nous Research", "nousresearch.com", "Hermes runtime environment", "Mid-turn user steering", "Active Hermes profile"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("真实样本残留 %q", bad)
+		}
+	}
+	t.Logf("fixture 改写完成，长度 %d -> %d", len(raw), len(out))
 }
