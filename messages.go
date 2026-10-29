@@ -512,6 +512,7 @@ func convertAnthropicTools(tools []any) []any {
 			fn["description"] = d
 		}
 		if p, ok := t["input_schema"]; ok && p != nil {
+			p, _ = normalizeToolSchema(p)
 			fn["parameters"] = p
 		}
 		out = append(out, map[string]any{"type": "function", "function": fn})

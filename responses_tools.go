@@ -82,6 +82,9 @@ func functionTool(name, description string, parameters any, strict any) map[stri
 		fn["description"] = description
 	}
 	if parameters != nil {
+		// Repair malformed schemas (e.g. `required` serialized as `{}`) before
+		// they reach WorkBuddy, which rejects them with 400/11129.
+		parameters, _ = normalizeToolSchema(parameters)
 		fn["parameters"] = parameters
 	}
 	if strict != nil {

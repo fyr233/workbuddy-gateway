@@ -1863,9 +1863,24 @@ func isRateLimited(statusCode int, body string) bool {
 	return false
 }
 
-func isModelRateLimited(body string) bool {
+func isInvalidToolSchemaError(body string) bool {
 	low := strings.ToLower(body)
-	return strings.Contains(body, `"code":6004`) || strings.Contains(body, "切换其他模型") || strings.Contains(low, "switch to another model")
+	return strings.Contains(body, `"code":11129`) ||
+		strings.Contains(low, "invalid_function_parameters") ||
+		strings.Contains(low, "invalid function call parameters")
+}
+
+// isModelRateLimited reports a model-level rate limit. It deliberately does NOT
+// match on the English "switch to another model" phrase: WorkBuddy puts that in
+// the display tips of 11129 (invalid tool schema) as well, and treating a
+// client-side schema error as a rate limit used to cool every account in the
+// pool for 60s — which surfaced as a 503 to sub2api and failed the whole group
+// over to the backup account.
+func isModelRateLimited(body string) bool {
+	if isInvalidToolSchemaError(body) {
+		return false
+	}
+	return strings.Contains(body, `"code":6004`) || strings.Contains(body, "切换其他模型")
 }
 
 func isQuotaExhausted(statusCode int, body string) bool {
@@ -3999,6 +4014,16 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
 	prepareConversationContext(r, reqObj)
+
+	// 修正客户端畸形工具定义（如 `required` 被序列化成 `{}`）。
+	// WorkBuddy 会以 400/11129 拒绝这种定义，而网关曾把它误判为模型限流，
+	// 一次坏请求就冷却整个账号池。
+	if repaired := normalizeRequestToolSchemas(reqObj); repaired > 0 {
+		log.Printf("[#%d] 已修正 %d 处工具 schema（required 非数组）", reqID, repaired)
+		debugEvent(r, "warn", "tool_schema_repaired", map[string]any{
+			"repaired_required_fields": repaired,
+		})
+	}
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
 	if disabled, reason := modelDisabled(modelName); disabled {
