@@ -381,7 +381,7 @@ func TestEnterpriseQuotaUsesAllocatedUsageNotPersonalPackages(t *testing.T) {
 	if acc.ModelStates["glm-5.3-flash"].QuotaBlocked {
 		t.Fatal("positive enterprise allocation must clear the false quota block")
 	}
-	picked, _, err := nextAccountForModel("glm-5.3-flash", nil)
+	picked, _, err := nextAccountForModel("glm-5.3-flash", nil, "")
 	if err != nil || picked != acc {
 		t.Fatalf("paid model should be schedulable, picked=%v err=%v", picked, err)
 	}
@@ -412,7 +412,7 @@ func TestEnterpriseQuotaUsesAllocatedUsageNotPersonalPackages(t *testing.T) {
 	if !strings.Contains(table, "不限") || !strings.Contains(table, planEnterprise) || strings.Contains(table, "付费耗尽") {
 		t.Fatalf("unlimited display wrong:\n%s", table)
 	}
-	if _, _, err := nextAccountForModel("glm-5.3-flash", nil); err != nil {
+	if _, _, err := nextAccountForModel("glm-5.3-flash", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -423,7 +423,7 @@ func TestEnterpriseQuotaUsesAllocatedUsageNotPersonalPackages(t *testing.T) {
 	if !acc.QuotaExhausted || acc.QuotaUnlimited || acc.QuotaRemaining != 0 {
 		t.Fatalf("used-up allocation should exhaust: %+v", acc)
 	}
-	if _, _, err := nextAccountForModel("glm-5.3-flash", nil); err == nil || !strings.Contains(err.Error(), "额度阻断=1") {
+	if _, _, err := nextAccountForModel("glm-5.3-flash", nil, ""); err == nil || !strings.Contains(err.Error(), "额度阻断=1") {
 		t.Fatalf("used-up enterprise allocation should block paid model, err=%v", err)
 	}
 

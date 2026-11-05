@@ -61,14 +61,33 @@ func prepareUpstreamChatRequest(obj map[string]any, r *http.Request, requestID u
 	profile := requestProfileFor(r)
 	trace := debugTraceID(r)
 	applyThinkingRules(obj, model)
+	// 修正客户端畸形工具定义（如 `required` 被序列化成 `{}`）。
+	// WorkBuddy 以 400/11129 拒绝这类定义；网关过去会把它误判为模型限流。
+	if repaired := normalizeRequestToolSchemas(obj); repaired > 0 {
+		log.Printf("[工具schema] traceId=%s requestId=%d 修正字段数=%d 结果=required 已归一化为数组", trace, requestID, repaired)
+	}
 	normalizeDeveloperRoles(obj, r, requestID)
+	// 私有提示词层：把官方默认 system 的散文段整段重写为中性中文，从根上摆脱
+	// 上游针对官方提示词短语的黑名单。必须在身份替换之前，因为替换会把官方
+	// 句子就地归一化（"DeepSeek Harness Web GUI" → "Web GUI"），改写后官方
+	// 段落特征消失，私有规则就再也匹配不上。幂等，注入后需再补一次。
+	applyDSHPrivateSystemPrompt(obj, r, requestID, model)
+	applyHermesPrivatePrompt(obj, r, requestID)
 	// 首位通配只在客户端原始块上执行一次，不跨协议合并后的文本块边界。
 	applyOriginalIdentityReplacements(obj, r, requestID)
 	if profile == requestProfileOfficial {
 		mergeLeadingInstructionMessages(obj, r, requestID)
 	}
 	prepareSystemPromptForUpstream(obj, r, requestID, trace)
+	// 配置的 fallback/force 在上一步才注入，可能又带入官方段落，补一次。
+	applyDSHPrivateSystemPrompt(obj, r, requestID, model)
+	applyHermesPrivatePrompt(obj, r, requestID)
 	applyIdentityRulePass(obj, r, requestID, false)
+	// 代码标识符（__DSH_BOOT__、dsh web、裸 DSH）由 base64 承载：
+	// 上游不处理这类标识，改假名字会让模型给出错误技术事实。
+	if n := normalizeDSHIdentifiers(obj); n > 0 {
+		log.Printf("[DSH标识符] traceId=%s requestId=%d 命中规则=%d 结果=已base64承载", debugTraceID(r), requestID, n)
+	}
 	ensureUpstreamMaxTokens(obj, r, requestID, trace, model)
 	if profile == requestProfileOfficial {
 		applyOfficialBodyDefaults(obj, r, requestID, model)

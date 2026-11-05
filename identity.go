@@ -19,6 +19,10 @@ type runtimeIdentityConfig struct {
 	// ResponseRestore 默认关闭。开启后只改写响应可见正文：把出站时被替换掉的
 	// 客户端身份还原回来。入站请求处理与出站请求体完全不受影响。
 	ResponseRestore *bool `json:"responseRestore,omitempty"`
+	// AssistantScope 默认关闭。关闭时身份 / GUI / 标识符三类改写只作用于
+	// system 与 developer；开启后才把 assistant 历史也纳入。默认关闭的理由：
+	// assistant 是模型已产出的对话内容，改写等于篡改会话事实。
+	AssistantScope *bool `json:"assistantScope,omitempty"`
 }
 
 type identityReplacement struct {
@@ -92,6 +96,9 @@ func defaultIdentityConfig() runtimeIdentityConfig {
 }
 
 func setIdentityConfig(c runtimeIdentityConfig) {
+	if c.AssistantScope != nil {
+		setAssistantScope(*c.AssistantScope)
+	}
 	settings := buildIdentitySettings(c)
 	identityConfigMu.Lock()
 	currentIdentity = settings
