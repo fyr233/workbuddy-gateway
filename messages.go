@@ -516,6 +516,8 @@ func convertAnthropicTools(tools []any) []any {
 			fn["description"] = d
 		}
 		if p, ok := t["input_schema"]; ok && p != nil {
+			// 畸形 schema（required 为对象/空值）会被上游以 11129 拒绝。
+			p, _ = normalizeToolSchema(p)
 			fn["parameters"] = p
 		}
 		out = append(out, map[string]any{"type": "function", "function": fn})

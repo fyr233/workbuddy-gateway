@@ -82,6 +82,8 @@ func functionTool(name, description string, parameters any, strict any) map[stri
 		fn["description"] = description
 	}
 	if parameters != nil {
+		// 畸形 schema（required 为对象/空值）会被上游以 11129 拒绝。
+		parameters, _ = normalizeToolSchema(parameters)
 		fn["parameters"] = parameters
 	}
 	if strict != nil {

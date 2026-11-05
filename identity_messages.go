@@ -58,9 +58,8 @@ func applyIdentityRulePass(obj map[string]any, r *http.Request, requestID uint64
 		if !ok {
 			continue
 		}
-		switch roleOfMessage(message) {
-		case "system", "developer", "assistant":
-		default:
+		// assistant 默认不参与改写：它是模型已产出的对话内容，改动等于篡改会话事实。
+		if !identityRoleInScope(roleOfMessage(message)) {
 			continue
 		}
 		switch content := message["content"].(type) {
@@ -90,7 +89,7 @@ func logIdentityReplacementPass(r *http.Request, requestID uint64, enabled bool,
 	if trace == "" {
 		trace = r.Header.Get("X-Trace-ID")
 	}
-	log.Printf("[配置文字替换] traceId=%s requestId=%d 启用=%t 修改文本块=%d 字面命中=%d 首位通配命中=%d 结果=%s 说明=applied为已替换，no_change为原样保留，identity_disabled为配置关闭；仅处理system/developer/assistant，未记录规则或提示词正文",
+	log.Printf("[配置文字替换] traceId=%s requestId=%d 启用=%t 修改文本块=%d 字面命中=%d 首位通配命中=%d 结果=%s 说明=applied为已替换，no_change为原样保留，identity_disabled为配置关闭；处理system/developer，assistant仅在assistantScope开启时处理，未记录规则或提示词正文",
 		trace, requestID, enabled, changed, literal, wildcard, result)
 	event := "identity_replacements_applied"
 	if changed == 0 {

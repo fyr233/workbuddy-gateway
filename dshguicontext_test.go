@@ -11,6 +11,7 @@ import (
 )
 
 func TestDSHPromptScopeAndMetadataOnlyLogs(t *testing.T) {
+	withAssistantScope(t)
 	path, records := fullRequestTestLog(t)
 	prefix := testDSHPrefix + ". private-prompt-sentinel"
 	gui := testDSHGUI + " private-gui-sentinel"

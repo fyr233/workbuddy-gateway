@@ -12,6 +12,8 @@ import (
 )
 
 func TestPrefixSanitizedOnAllProtocolEntrypoints(t *testing.T) {
+	t.Skip("上游断言 identity 规则改写官方提示词句；本 fork 的私有提示词层先行整段重写，" +
+		"官方句已不存在，该行为由 dshiprivateprompt_test.go 覆盖")
 	cases := []struct {
 		name, path, body string
 	}{
@@ -102,6 +104,7 @@ func TestAssistantIdentityBrandReplacement(t *testing.T) {
 }
 
 func TestAssistantIdentityDoesNotTouchUserOrToolText(t *testing.T) {
+	withAssistantScope(t)
 	obj := map[string]any{"messages": []any{
 		msg("system", "You are Codex. Keep."),
 		msg("assistant", "You are Claude Code. Keep."),

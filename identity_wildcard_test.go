@@ -115,6 +115,8 @@ func TestIdentityRulePriorityAndSingleWildcardMatch(t *testing.T) {
 }
 
 func TestEveryFormerHardcodedRuleRequiresConfigAndHonorsDisable(t *testing.T) {
+	t.Skip("上游断言 identity 规则改写官方提示词句；本 fork 的私有提示词层先行整段重写，" +
+		"官方句已不存在，该行为由 dshiprivateprompt_test.go 覆盖")
 	isolatedGatewayConfig(t)
 	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
 	text := testDSHPrefix + ".\n" + testDSHGUI +
@@ -149,6 +151,7 @@ func TestEveryFormerHardcodedRuleRequiresConfigAndHonorsDisable(t *testing.T) {
 }
 
 func TestDefaultTemplateRulesNeverModifyUserOrToolMessages(t *testing.T) {
+	withAssistantScope(t)
 	isolatedGatewayConfig(t)
 	setIdentityConfig(runtimeIdentityConfig{})
 	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
@@ -285,6 +288,8 @@ func TestIdentityWildcardDoesNotCrossOriginalBlocksAfterConcatenation(t *testing
 }
 
 func TestIdentityWildcardProcessesInjectedPromptsSeparately(t *testing.T) {
+	t.Skip("上游断言 identity 规则改写官方提示词句；本 fork 的私有提示词层先行整段重写，" +
+		"官方句已不存在，该行为由 dshiprivateprompt_test.go 覆盖")
 	isolatedGatewayConfig(t)
 	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
 	setIdentityConfig(runtimeIdentityConfig{Replacements: map[string]string{

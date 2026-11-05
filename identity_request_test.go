@@ -18,6 +18,7 @@ import (
 )
 
 func TestIdentityIsOnlyConfigurableReplacementInOutboundRequests(t *testing.T) {
+	withAssistantScope(t)
 	const original = "Codex; workspace root; are paths the user; legacy phrase; Grok Build; Grok released by xAI"
 	for _, tc := range []struct {
 		name, config, want string
@@ -298,6 +299,8 @@ func TestNoImplicitXAIRewriteWithoutConfiguredWildcard(t *testing.T) {
 }
 
 func TestGrokBuildThroughHTTP(t *testing.T) {
+	t.Skip("上游断言 identity 规则改写官方提示词句；本 fork 的私有提示词层先行整段重写，" +
+		"官方句已不存在，该行为由 dshiprivateprompt_test.go 覆盖")
 	disabled := false
 	for _, tc := range []struct {
 		name, input, want string
