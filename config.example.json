@@ -8,7 +8,11 @@
   },
   "systemPrompt": {
     "fallback": "",
-    "force": ""
+    "force": "",
+    "dshPrivate": {
+      "enabled": true,
+      "agentName": "蓝色大肥鱼"
+    }
   },
   "identity": {
     "enabled": true,

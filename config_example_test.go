@@ -72,6 +72,9 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
 	identityEnabled := true
 	identityResponseRestore := false
+	// dshPrivate 是本 fork 的配置段（DSH 私有提示词层），示例文件必须与结构一致。
+	exampleSchema.SystemPrompt.DSHPrivate.Enabled = &identityEnabled
+	exampleSchema.SystemPrompt.DSHPrivate.AgentName = "蓝色大肥鱼"
 	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy",
 		Replacements: defaultIdentityReplacements("WorkBuddy"), ResponseRestore: &identityResponseRestore}
 	schema, err := json.Marshal(exampleSchema)

@@ -71,6 +71,12 @@ type runtimeFileConfig struct {
 	SystemPrompt struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
+		// DSHPrivate 控制 DSH 官方默认提示词的整段中性化改写（本 fork 特性）。
+		// 省略时默认启用，agentName 为空则用内置名。
+		DSHPrivate struct {
+			Enabled   *bool  `json:"enabled,omitempty"`
+			AgentName string `json:"agentName,omitempty"`
+		} `json:"dshPrivate,omitempty"`
 	} `json:"systemPrompt"`
 	// Identity 控制 system/developer/assistant 中所有配置文字替换。
 	// 省略时使用内置 WorkBuddy 展示名及默认文本规则。

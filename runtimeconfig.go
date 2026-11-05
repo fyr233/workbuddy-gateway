@@ -356,6 +356,7 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
+	setDSHPrivatePromptConfig(c.SystemPrompt.DSHPrivate.Enabled, c.SystemPrompt.DSHPrivate.AgentName)
 	setIdentityConfig(c.Identity)
 	deprecatedPromptCompatibilityPresent.Store(len(c.DeprecatedPromptCompatibility) > 0)
 	modelConcurrency.configure(c.Concurrent)
