@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -74,6 +75,82 @@ type planResource struct {
 	DeductionEndTime   json.RawMessage `json:"DeductionEndTime"`
 	ExpiredTime        json.RawMessage `json:"ExpiredTime"`
 	CycleEndTime       json.RawMessage `json:"CycleEndTime"`
+	// 积分包的实际余量。上游用字符串承载，个别字段可能是数字，统一用 RawMessage 兼容。
+	CapacitySize   json.RawMessage `json:"CapacitySize"`
+	CapacityUsed   json.RawMessage `json:"CapacityUsed"`
+	CapacityRemain json.RawMessage `json:"CapacityRemain"`
+	CapacityType   json.RawMessage `json:"CapacityType"`
+	CapacityUnit   string          `json:"CapacityUnit"`
+}
+
+// creditGrant 是一个「还有剩余、且未过期」的积分包。
+// 上游的积分按包下发（签到 100/天、赠送包、订阅包），每个包有独立到期时间，
+// 所以过期优先必须落到包这一级，不能用账号级的月度周期冒充。
+type creditGrant struct {
+	Remain   float64
+	ExpireAt time.Time
+	Package  string
+}
+
+// creditAmount 解析积分数量字段；缺失或非数字返回 0。
+func creditAmount(raw json.RawMessage) float64 {
+	s := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if s == "" || s == "null" {
+		return 0
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0
+	}
+	return n
+}
+
+// creditGrantOf 判断一个资源是否为「仍可消耗的积分包」，是则返回其剩余与到期时间。
+// Status: 0=有效；1/2=退款或过期；3=已用尽。用尽的包不再参与调度与排序。
+func creditGrantOf(r planResource, now time.Time) (creditGrant, bool) {
+	status, err := planInteger(r.Status)
+	if err != nil || status != 0 {
+		return creditGrant{}, false
+	}
+	remain := creditAmount(r.CapacityRemain)
+	if remain <= 0 {
+		return creditGrant{}, false
+	}
+	// 截止时间取所有已给出字段中的**最早**一个，而不是第一个非空字段：
+	// 这里问的是「这个包里剩下的积分什么时候作废」。月付套餐的 DeductionEndTime 可能
+	// 远在 2050 年，但 CycleEndTime 是本周期末，未用部分届时清零 —— 那才是真正的浪费点。
+	// activePlanResource 问的是「权益是否仍有效」，所以用优先级取第一个即可，两者语义不同。
+	expire := time.Time{}
+	for _, raw := range []json.RawMessage{r.DeductionEndTime, r.ExpiredTime, r.CycleEndTime} {
+		end, present, err := planTimestamp(raw)
+		if err != nil || !present {
+			continue
+		}
+		if expire.IsZero() || end.Before(expire) {
+			expire = end
+		}
+	}
+	if !expire.IsZero() && !now.Before(expire) {
+		return creditGrant{}, false // 已过期，别再算进可用余量。
+	}
+	return creditGrant{Remain: remain, ExpireAt: expire, Package: r.PackageCode}, true
+}
+
+// summarizeCredits 汇总账号的可用积分：总剩余 + 最近到期时刻。
+// 最近到期时刻用于「先吃掉快过期的」，总剩余用于「按余额比例分摊」。
+func summarizeCredits(resources []planResource, now time.Time) (remain float64, expireAt time.Time, grants int) {
+	for _, r := range resources {
+		g, ok := creditGrantOf(r, now)
+		if !ok {
+			continue
+		}
+		remain += g.Remain
+		grants++
+		if !g.ExpireAt.IsZero() && (expireAt.IsZero() || g.ExpireAt.Before(expireAt)) {
+			expireAt = g.ExpireAt
+		}
+	}
+	return remain, expireAt, grants
 }
 
 func planInteger(raw json.RawMessage) (int64, error) {

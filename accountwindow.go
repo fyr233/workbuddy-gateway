@@ -217,6 +217,10 @@ func tokenCountOf(usage map[string]any) int64 {
 
 // accountWeight 返回该账号在负载均衡里的权重。
 // 付费账号月积分 7000（3000 签到 + 4000 套餐），免费账号 3000，权重按积分比例分配。
+//
+// Deprecated: 这是「按周期总额度」分配的历史口径。总额大的账号被派得更多，
+// 但总额不反映还剩多少，结果是总额高、余额少的账号最先被打空（2026-11 cn 账号实测）。
+// 调度一律走 accountPriorityWeight。
 func accountWeight(acc *Account) int64 {
 	if acc == nil {
 		return 1
@@ -230,15 +234,77 @@ func accountWeight(acc *Account) int64 {
 	return 3000
 }
 
+const (
+	// 权重下限/上限：避免 float 极端值把加权轮询压死或让某号独占。
+	priorityWeightFloor = 1e-4
+	priorityWeightCeil  = 1e6
+	// 到期望远镜：没有到期信息的账号按「30 天后到期」参与计算，
+	// 让它既不抢被快过期的号，也不会被永久饿死。
+	priorityDefaultHorizon = 30 * 24 * time.Hour
+	// 到期不足 1 小时按 1 小时算，防止 R/T 爆炸。
+	priorityMinHorizon = time.Hour
+)
+
+// accountPriorityWeight 返回账号的调度权重（浮点，越大分到的请求越多）。
+//
+// 目标是两个约束同时成立：
+//  1. 没有积分被浪费 —— 快过期的积分必须先烧掉；
+//  2. 没有账号率先耗尽 —— 各账号的「余额消耗速率」应当与其可用时间成正比。
+//
+// 为此权重取「余额 / 距到期小时数」，即该账号**必须的燃烧速率**。
+// 按这个速率分配流量时，若总运力足够，所有账号会在**各自到期时刻**同时归零，
+// 既不会有人提前打空，也不会有余额过期作废；运力不足时，最紧迫的号仍然优先。
+//
+// 这与旧的「按 QuotaTotal 加权」有本质区别：旧口径只看周期总额，不看剩多少，
+// 于是总额最大的号被派最多请求、最先被打空 —— 正是 cn 账号被用光的原因。
+func accountPriorityWeight(acc *Account, now time.Time) float64 {
+	if acc == nil {
+		return priorityWeightFloor
+	}
+	// 余额优先取积分包汇总；拿不到积分包（企业号/旧快照/接口失败）时退到个人周期剩余。
+	remain := acc.CreditRemain
+	haveGrants := acc.CreditGrants > 0
+	if !haveGrants {
+		if acc.QuotaUnlimited {
+			return priorityWeightFloor // 不限量：不参与紧张度竞争，靠轮询摊平
+		}
+		remain = acc.QuotaRemaining
+	}
+	if remain <= 0 {
+		// 没有可用余额：给一个极小的权重，让它只在别的号都不可用时才被选中。
+		return priorityWeightFloor
+	}
+	horizon := priorityDefaultHorizon
+	if haveGrants && acc.CreditExpireAt > 0 {
+		horizon = time.Unix(acc.CreditExpireAt, 0).Sub(now)
+		if horizon < priorityMinHorizon {
+			horizon = priorityMinHorizon
+		}
+	}
+	w := remain / horizon.Hours()
+	// 已经越过 48h 软线的账号压到最低：它再吃流量就会撞上游硬墙，
+	// 而硬墙冷却 16~30 小时，比等它自然过期的代价大得多。
+	if windowOverLimit(acc) {
+		w *= 0.01
+	}
+	if w < priorityWeightFloor {
+		w = priorityWeightFloor
+	}
+	if w > priorityWeightCeil {
+		w = priorityWeightCeil
+	}
+	return w
+}
+
 // weightScore 返回该账号的「虚拟完成时间」，值最小者优先（加权轮询）。
-func weightScore(path string, weight int64) float64 {
+func weightScore(path string, weight float64) float64 {
 	if weight <= 0 {
 		weight = 1
 	}
 	weightMu.Lock()
 	c := weightCounters[path]
 	weightMu.Unlock()
-	return float64(c) / float64(weight)
+	return float64(c) / weight
 }
 
 // pruneWeightCounters 删除已不在账号池中的路径计数。

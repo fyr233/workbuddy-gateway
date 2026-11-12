@@ -488,6 +488,11 @@ type Account struct {
 	QuotaKnown     bool                          // 是否已成功获取过额度
 	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
 	QuotaUnlimited bool                          // 企业版 limitNum=-1：分配额度不限，禁止按 0 余额阻断
+	// 积分包级汇总：调度按「剩余积分 × 到期紧迫度」加权，而不是按总额度。
+	// CreditRemain 来自资源包的 CapacityRemain 之和；CreditExpireAt 是最近到期的那个包的截止时刻。
+	CreditRemain   float64                       // 未过期且仍有剩余的积分包余量合计
+	CreditExpireAt int64                         // 最近到期的积分包截止时间（Unix 秒），0=未知
+	CreditGrants   int                           // 参与汇总的有效积分包个数
 	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
 	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.RWMutex                  // 凭据维护写锁；模型发送共享读锁，并发数由 concurrent 控制
@@ -1117,6 +1122,9 @@ func restoreAccountRuntimeStateLocked() {
 		}
 		acc.QuotaKnown = state.QuotaKnown
 		acc.QuotaUnlimited = state.QuotaUnlimited
+		acc.CreditRemain = state.CreditRemain
+		acc.CreditExpireAt = state.CreditExpireAt
+		acc.CreditGrants = state.CreditGrants
 		acc.QuotaExhausted = state.QuotaExhausted && !state.QuotaUnlimited
 		if len(state.ModelStates) == 0 {
 			continue
@@ -1467,7 +1475,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 				if !ok || kind != wanted {
 					continue
 				}
-				score := weightScore(acc.Path, accountWeight(acc))
+				score := weightScore(acc.Path, accountPriorityWeight(acc, now))
 				if best == nil || score < bestScore {
 					best, bestKind, bestScore = acc, kind, score
 				}
@@ -2209,7 +2217,7 @@ func parseEnterpriseJSONNumber(raw json.RawMessage) (float64, error) {
 
 // applyQuotaObservation 写入额度并在余额恢复或不限量时解除模型额度阻断。
 // 调用方可以持有账号锁；这里只取账号池锁。
-func applyQuotaObservation(acc *Account, total, used, remaining float64, unlimited, paid bool, plan string, planOK bool, now time.Time) (wasExhausted, exhausted bool, display string) {
+func applyQuotaObservation(acc *Account, total, used, remaining float64, unlimited, paid bool, plan string, planOK bool, now time.Time, resources []planResource) (wasExhausted, exhausted bool, display string) {
 	accountMu.Lock()
 	defer accountMu.Unlock()
 	wasExhausted = acc.QuotaExhausted
@@ -2218,6 +2226,18 @@ func applyQuotaObservation(acc *Account, total, used, remaining float64, unlimit
 	acc.QuotaRemaining = remaining
 	acc.QuotaUnlimited = unlimited
 	acc.IsPaidUser = paid
+	// 积分包级汇总：只有拿到资源明细时才覆盖，否则保留上一次结果，
+	// 避免一次接口抖动把调度权重打回「按周期总额」的旧口径。
+	if resources != nil {
+		remain, exp, grants := summarizeCredits(resources, now)
+		acc.CreditRemain = remain
+		acc.CreditGrants = grants
+		if exp.IsZero() {
+			acc.CreditExpireAt = 0
+		} else {
+			acc.CreditExpireAt = exp.Unix()
+		}
+	}
 	if planOK {
 		acc.PlanLabel = plan
 		acc.PlanCheckedAt = now.Unix()
@@ -2440,7 +2460,7 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	if planErr == nil {
 		plan, planErr = identifyPlan(prof.Key, summary, resources, now)
 	}
-	wasExhausted, exhausted, plan := applyQuotaObservation(acc, total, used, remaining, false, paid, plan, planErr == nil, now)
+	wasExhausted, exhausted, plan := applyQuotaObservation(acc, total, used, remaining, false, paid, plan, planErr == nil, now, resources)
 	if planErr != nil {
 		log.Printf("[套餐判断] traceId=%s 账号=%s 结果=待确认 原因=%v 显示=%s 业务影响=额度仍更新，不把接口失败误报为免费或试用", traceID, path, planErr, plan)
 	} else {
@@ -2490,7 +2510,7 @@ func refreshEnterpriseAccountQuota(ctx context.Context, acc *Account, auth Store
 		return err
 	}
 	now := time.Now()
-	wasExhausted, exhausted, plan := applyQuotaObservation(acc, total, used, remaining, unlimited, false, planEnterprise, true, now)
+	wasExhausted, exhausted, plan := applyQuotaObservation(acc, total, used, remaining, unlimited, false, planEnterprise, true, now, nil)
 	log.Printf("[套餐判断] traceId=%s 账号=%s 结果=%s 说明=企业号没有个人套餐资源包，不调用 get-user-resource，显示=%s", traceID, path, planEnterprise, plan)
 	totalText := formatQuotaAmount(unlimited, "total", total)
 	remainText := formatQuotaAmount(unlimited, "remaining", remaining)
@@ -2785,6 +2805,10 @@ type accountSnapshot struct {
 	QuotaKnown       bool                          `json:"quotaKnown,omitempty"`
 	QuotaExhausted   bool                          `json:"quotaExhausted,omitempty"`
 	QuotaUnlimited   bool                          `json:"quotaUnlimited,omitempty"`
+	CreditRemain     float64                       `json:"creditRemain,omitempty"`
+	CreditExpireAt   int64                         `json:"creditExpireAt,omitempty"`
+	CreditGrants     int                           `json:"creditGrants,omitempty"`
+	PriorityWeight   float64                       `json:"priorityWeight,omitempty"` // 当前调度权重（余额/剩余小时），仅展示用
 	ModelStates      map[string]modelStateSnapshot `json:"modelStates,omitempty"`
 	FreeModels       int                           `json:"freeModels,omitempty"` // 旧版快照兼容字段；账号表不再显示，不参与调度
 	ModelCooldowns   int                           `json:"modelCooldowns,omitempty"`
@@ -2841,6 +2865,10 @@ func writeStatusSnapshot() error {
 		as.QuotaKnown = acc.QuotaKnown
 		as.QuotaExhausted = acc.QuotaExhausted
 		as.QuotaUnlimited = acc.QuotaUnlimited
+		as.CreditRemain = acc.CreditRemain
+		as.CreditExpireAt = acc.CreditExpireAt
+		as.CreditGrants = acc.CreditGrants
+		as.PriorityWeight = accountPriorityWeight(acc, now)
 		if len(acc.ModelStates) > 0 {
 			as.ModelStates = make(map[string]modelStateSnapshot, len(acc.ModelStates))
 			for model, state := range acc.ModelStates {
