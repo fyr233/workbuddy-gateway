@@ -167,3 +167,21 @@ func TestWeightsEqualizeBurnDown(t *testing.T) {
 		}
 	}
 }
+
+// 国际站实测：资源包 CapacityRemain 恒为 100，但周期摘要剩余只有 42.76。
+// 两个口径冲突时取小，避免高估余额。
+func TestPriorityWeightUsesConservativeRemain(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		CreditRemain:   100,
+		CreditGrants:   1,
+		CreditExpireAt: now.Add(400 * time.Hour).Unix(),
+		QuotaKnown:     true,
+		QuotaRemaining: 42.76,
+	}
+	got := accountPriorityWeight(acc, now)
+	want := 42.76 / 400
+	if got < want*0.9 || got > want*1.1 {
+		t.Fatalf("应取较小的 42.76，期望约 %.4f，实际 %.4f", want, got)
+	}
+}

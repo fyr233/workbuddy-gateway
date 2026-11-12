@@ -269,6 +269,11 @@ func accountPriorityWeight(acc *Account, now time.Time) float64 {
 			return priorityWeightFloor // 不限量：不参与紧张度竞争，靠轮询摊平
 		}
 		remain = acc.QuotaRemaining
+	} else if acc.QuotaRemaining >= 0 && acc.QuotaKnown && acc.QuotaRemaining < remain {
+		// 两个口径不一致时取小：国际站的资源包 CapacityRemain 实测不随消耗回落
+		// （包显示 100，而周期摘要剩余只有 42.76），以较保守的一方为准，
+		// 避免高估余额把流量派给快要耗尽的账号。
+		remain = acc.QuotaRemaining
 	}
 	if remain <= 0 {
 		// 没有可用余额：给一个极小的权重，让它只在别的号都不可用时才被选中。
