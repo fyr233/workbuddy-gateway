@@ -1,28 +1,34 @@
 package main
 
-// accountwindow.go —— 账号级 48 小时滚动 token 窗口 + 软阈值。
+// accountwindow.go —— 账号级 24 小时滚动 token 窗口 + 软阈值。
 //
-// 背景（2026-10 实测）：workbuddy 上游对每个账号有滚动 48 小时的 token 配额。
-// 用满后返回 code 6004，文案形如
+// 背景：workbuddy 上游对每个账号有滚动 24 小时的 token 配额。用满后返回
+// code 6004，文案形如
 //
 //	usage exceeds frequency limit, but don't worry, your usage will reset at <时刻>
 //
-// 并且该冷却会跳到 16~30 小时后，无法通过重启网关清除（重置在上游服务器侧）。
-// 实测等效上限：
+// 该冷却会跳到 6~30 小时后，无法通过重启网关清除（重置在上游服务器侧）。
 //
-//	国际站免费账号（额度 100）      ≈ 1.01 亿 token（100.9M / 101.0M 两个账号吻合）
-//	国内站 2200/2900 额度账号       ≈ 2.1 亿 token（209.2M / 209.5M 吻合）
-//	国内站 4500 额度账号            ≈ 2.4 亿 token（239.4M）
+// 实测口径（关键）：对 25 次 CN 429 与 31 次 INTL 429，取 [reset-24h, 触发]
+// 这个区间去量，窗口内用量分别稳定在
 //
-// 本文件按小时分桶累计每个账号的 token 消耗，维护 48+1 个桶的滚动窗口；当窗口内
-// 累计值达到阈值（默认取实测值的 ~85%，留安全边际）时，该账号在选号阶段被**软排除**：
+//	国内站账号（体验版）  200M（均值 200.4M，标准差 0.98M，20/25 落在 199~201M）
+//	国际站免费账号        100M（逐个落在 100.0~102.7M）
+//
+// 所以窗口是 24 小时、不是 48 小时；阈值是 200M / 100M、不是 175M / 85M。
+// 早期按 48 小时切片得到 400M/450M 的「交替值」，那是把上个周期的用量混了进来。
+//
+// 本文件按小时分桶累计每个账号的 token 消耗，维护 24+1 个桶的滚动窗口；当窗口内
+// 累计值达到软阈值（实测值的 95%：190M / 95M）时，该账号在选号阶段被**软排除**：
 // 优先用其他账号；只有全部账号都越过软线时才回落到余量最大的账号。这样既能「尽量
-// 吃满」每个账号的额度，又避免撞到上游硬墙后长时间（16~30 小时）不可用。
+// 吃满」每个账号的额度，又避免撞到上游硬墙后长时间不可用。
+//
+// 付费账号的限流规则未知，不猜值、不纳入软限（只靠 429 被动冷却）。
 //
 // 阈值来源（环境变量，容器启动时用 -e 指定）：
 //
-//	WBGW_WINDOW_LIMIT_INTL  国际站账号的 48h 软阈值，默认 85000000
-//	WBGW_WINDOW_LIMIT_CN    国内站账号的 48h 软阈值，默认 175000000
+//	WBGW_WINDOW_LIMIT_INTL  国际站账号的 24h 软阈值，默认 95000000
+//	WBGW_WINDOW_LIMIT_CN    国内站账号的 24h 软阈值，默认 190000000
 //	WBGW_WINDOW_DISABLED    置 1 关闭本机制
 //
 // 计数含缓存命中（与上游 usage.total_tokens 同口径），因此是保守估计。
@@ -41,18 +47,19 @@ import (
 )
 
 const (
-	tokenWindowHours     = 48
-	tokenWindowBucketCap = tokenWindowHours + 2 // 当前小时 + 48 个历史小时 + 余量
+	// 窗口与阈值来自实测：对 25 次 CN 429 与 31 次 INTL 429，用 [reset-24h, 触发]
+	// 这个区间去量，用量分别稳定在 200M / 100M（标准差 <1M）。
+	// 原先写的 48 小时 / 175M / 85M 三个参数都不对。
+	tokenWindowHours     = 24
+	tokenWindowBucketCap = tokenWindowHours + 2 // 当前小时 + 24 个历史小时 + 余量
 	tokenWindowSaveEvery = 10 * time.Second
 )
 
 const (
-	defaultWindowLimitIntl = int64(85_000_000)
-	defaultWindowLimitCN   = int64(175_000_000)
-	// 付费账号额度约为免费账号的 7/3（免费=签到 3000 积分，付费=3000+4000=7000），
-	// 阈值按同一比例放大：免费 175M/85M → 付费 400M/200M。
-	defaultWindowLimitIntlPaid = int64(200_000_000)
-	defaultWindowLimitCNPaid   = int64(400_000_000)
+	// 软阈值取实测值的 95%：CN 200M→190M、INTL 100M→95M。
+	// 留 5%~10M 余量（约 10~20 个请求）够调度层切走，又不至于浪费额度。
+	defaultWindowLimitIntl = int64(95_000_000)
+	defaultWindowLimitCN   = int64(190_000_000)
 )
 
 type tokenBucket struct {
@@ -81,9 +88,8 @@ var (
 	windowLimitIntl = defaultWindowLimitIntl
 	windowLimitCN   = defaultWindowLimitCN
 
-	windowLimitIntlPaid = defaultWindowLimitIntlPaid
-	windowLimitCNPaid   = defaultWindowLimitCNPaid
-	windowDisabled      bool
+	// 付费账号的限流规则未知：不做猜测，直接不纳入软限。
+	windowDisabled bool
 
 	weightMu       sync.Mutex
 	weightCounters = map[string]int64{}
@@ -166,7 +172,7 @@ func loadTokenWindowsLocked() {
 func pruneBucketsLocked(w *accountTokenWindow, hour int64) {
 	// hour 是 Unix 小时戳（秒），窗口长度必须换算成秒：tokenWindowHours*3600。
 	// 这里曾经写成 hour - tokenWindowHours，等于只减 48 秒，
-	// 于是 48 小时窗口退化成「当前这一小时」，软限几乎永不触发（见 window_prune_test.go）。
+	// 于是 24 小时窗口退化成「当前这一小时」，软限几乎永不触发（见 window_prune_test.go）。
 	cut := hour - tokenWindowHours*3600
 	out := w.Buckets[:0]
 	for _, b := range w.Buckets {
@@ -192,22 +198,26 @@ func accountEditionOf(acc *Account) string {
 	return strings.ToLower(acc.Edition)
 }
 
-// accountTokenLimit 返回该账号的 48h 软阈值。
+// accountTokenLimit 返回该账号的 24h 软阈值。
+//
+// 实测口径：CN 账号每 24 小时 200M、INTL 每 24 小时 100M，超了上游回 429 code 6004。
+// 软阈值取实测值的 95%（190M / 95M）留出调度切换的余量。
+//
+// 付费账号：限流规则未知。不猜一个值上去，直接返回 0 = 不纳入软限，
+// 靠 429 反馈被动冷却。等有实测样本再补。
 func accountTokenLimit(acc *Account) int64 {
-	if windowDisabled {
+	if windowDisabled || acc == nil {
 		return 0
 	}
-	intl := accountEditionOf(acc) == "intl" || accountEditionOf(acc) == "global" || accountEditionOf(acc) == "international"
-	if acc.IsPaidUser || acc.PlanLabel != "" && !strings.Contains(acc.PlanLabel, "免费") && !strings.Contains(acc.PlanLabel, "体验") {
-		if intl {
-			return windowLimitIntlPaid
-		}
-		return windowLimitCNPaid
+	if acc.IsPaidUser || (acc.PlanLabel != "" && !strings.Contains(acc.PlanLabel, "免费") && !strings.Contains(acc.PlanLabel, "体验")) {
+		return 0
 	}
-	if intl {
+	switch accountEditionOf(acc) {
+	case "intl", "global", "international":
 		return windowLimitIntl
+	default:
+		return windowLimitCN
 	}
-	return windowLimitCN
 }
 
 // tokenCountOf 从上游 usage 取总 token（含缓存命中），取不到返回 0。
@@ -290,7 +300,7 @@ func accountPriorityWeight(acc *Account, now time.Time) float64 {
 		}
 	}
 	w := remain / horizon.Hours()
-	// 已经越过 48h 软线的账号压到最低：它再吃流量就会撞上游硬墙，
+	// 已经越过 24h 软线的账号压到最低：它再吃流量就会撞上游硬墙，
 	// 而硬墙冷却 16~30 小时，比等它自然过期的代价大得多。
 	if windowOverLimit(acc) {
 		w *= 0.01
@@ -389,7 +399,7 @@ func windowTotalLocked(w *accountTokenWindow) int64 {
 	return sum
 }
 
-// accountWindowUsage 返回该账号当前 48h 窗口内的累计 token 与阈值。
+// accountWindowUsage 返回该账号当前 24h 窗口内的累计 token 与阈值。
 func accountWindowUsage(acc *Account) (total int64, limit int64) {
 	if windowDisabled || acc == nil {
 		return 0, 0
@@ -408,7 +418,7 @@ func accountWindowUsage(acc *Account) (total int64, limit int64) {
 	return total, limit
 }
 
-// windowOverLimit 判断该账号是否已越过 48h 软阈值。
+// windowOverLimit 判断该账号是否已越过 24h 软阈值。
 func windowOverLimit(acc *Account) bool {
 	total, limit := accountWindowUsage(acc)
 	return limit > 0 && total >= limit

@@ -1503,15 +1503,15 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 			stickyBind(sessionKey, acc.Path, now)
 			return acc, kind, nil
 		}
-		// 免费站点（国际站）跑满 48h 软限后不再硬撑，切到其余站点继续服务，
+		// 免费站点（国际站）跑满 24h 软限后不再硬撑，切到其余站点继续服务，
 		// 让免费额度吃到软线为止，再用付费积分兜底。
-		log.Printf("[FreeSite] 模型 %s 的免费站点账号已全部越过 48h 软线或不可用，切换到其余站点代偿", model)
+		log.Printf("[FreeSite] 模型 %s 的免费站点账号已全部越过 24h 软线或不可用，切换到其余站点代偿", model)
 	}
 	if acc, kind, ok := pick(nil, true); ok {
 		stickyBind(sessionKey, acc.Path, now)
 		return acc, kind, nil
 	}
-	// 全部账号越过 48h 软线时的保底选号：取窗口余量最大者。
+	// 全部账号越过 24h 软线时的保底选号：取窗口余量最大者。
 	// 不继续按积分权重挑，因为高权重号通常也最接近硬墙，
 	// 先吃穿它会让随后的冷却时间最长。
 	var headroomAcc *Account
@@ -1540,7 +1540,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 	}
 	if headroomAcc != nil {
 		total, limit := accountWindowUsage(headroomAcc)
-		log.Printf("[TokenWindow] 模型 %s 全部账号均已越过 48h 软线，回退使用余量最大的 %s（窗口内=%d 阈值=%d）",
+		log.Printf("[TokenWindow] 模型 %s 全部账号均已越过 24h 软线，回退使用余量最大的 %s（窗口内=%d 阈值=%d）",
 			model, filepath.Base(headroomAcc.Path), total, limit)
 		if headroomKind == selectionProbeExhausted {
 			modelStateLocked(headroomAcc, model).NextProbeAt = now.Add(modelProbeDelay)
@@ -2361,7 +2361,7 @@ func usageTotalTokens(usage map[string]any) (int64, bool) {
 }
 
 func observeModelCredit(acc *Account, model string, usage map[string]any, reqID uint64) {
-	// 每次拿到上游 usage 都计入 48h 滚动窗口：这是该窗口唯一的记账入口，
+	// 每次拿到上游 usage 都计入 24h 滚动窗口：这是该窗口唯一的记账入口，
 	// 放在 credit 判空之前，才能覆盖免费模型（credit=0 但同样消耗 token 配额）。
 	if acc != nil {
 		recordAccountTokens(acc, tokenCountOf(usage))
@@ -3336,7 +3336,7 @@ func runServe() {
 
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
-	// 会话粘性与账号级 48h 滚动 token 软限：必须在 loadAccounts 之后初始化，
+	// 会话粘性与账号级 24h 滚动 token 软限：必须在 loadAccounts 之后初始化，
 	// 因为窗口落盘文件放在凭据目录下。
 	initTokenWindow()
 	initSticky()
