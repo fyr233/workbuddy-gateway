@@ -164,7 +164,10 @@ func loadTokenWindowsLocked() {
 }
 
 func pruneBucketsLocked(w *accountTokenWindow, hour int64) {
-	cut := hour - tokenWindowHours
+	// hour 是 Unix 小时戳（秒），窗口长度必须换算成秒：tokenWindowHours*3600。
+	// 这里曾经写成 hour - tokenWindowHours，等于只减 48 秒，
+	// 于是 48 小时窗口退化成「当前这一小时」，软限几乎永不触发（见 window_prune_test.go）。
+	cut := hour - tokenWindowHours*3600
 	out := w.Buckets[:0]
 	for _, b := range w.Buckets {
 		if b.Hour > cut && b.Tokens > 0 {
