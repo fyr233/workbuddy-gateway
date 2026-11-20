@@ -55,6 +55,49 @@ func TestDSHPrivatePromptReplacesOfficialSegments(t *testing.T) {
 			strings.Contains(got, "decode before use") || strings.Contains(got, "pnpm run dev:web") {
 			t.Fatalf("段 %d 替换后仍有官方特征: %q", i, got)
 		}
+		if i == 1 && got != "" {
+			t.Fatalf("摘要禁令段应整段删除，实际保留: %q", got)
+		}
+	}
+}
+
+// 摘要禁令段必须整段消失，且不能换成等价的私有中文表述。
+func TestDSHPrivatePromptDropsSummarySegment(t *testing.T) {
+	setDSHPrivatePromptConfig(nil, "测试名")
+	t.Cleanup(func() { setDSHPrivatePromptConfig(nil, "") })
+
+	identity := "You are a coding agent powered by the deepseek-v4.1-flash model."
+	summary := "Never produce a conversation summary, checkpoint, or <analysis>/<summary> block " +
+		"unless the user explicitly asks for one: context compaction is handled by the harness, " +
+		"and a summary you volunteer replaces the work you were asked to do."
+	atPaths := "Tokens prefixed with @ are paths the user explicitly referenced. " +
+		"@\"...\" quotes a path containing spaces."
+
+	system := identity + "\n\n" + summary + "\n\n" + atPaths
+	obj := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": system},
+	}}
+	applyDSHPrivateSystemPrompt(obj, dshTestRequest(), 1, "deepseek-v4.1-flash")
+	got := obj["messages"].([]any)[0].(map[string]any)["content"].(string)
+
+	for _, banned := range []string{
+		"Never produce a conversation summary",
+		"<analysis>/<summary>",
+		"对话摘要", "检查点", "上下文压缩由运行时负责",
+	} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("摘要禁令残留 %q: %q", banned, got)
+		}
+	}
+	// 邻居段不受影响，且不留空段落。
+	if !strings.Contains(got, dshPrivateAtPathsBlock) {
+		t.Fatalf("@ 段被误删: %q", got)
+	}
+	if !strings.Contains(got, "一名编码智能体") {
+		t.Fatalf("身份段被误删: %q", got)
+	}
+	if strings.Contains(got, "\n\n\n\n") {
+		t.Fatalf("删除后留下空段落: %q", got)
 	}
 }
 
@@ -161,12 +204,12 @@ func TestDSHPrivatePromptSkipsNonDSHRequests(t *testing.T) {
 	}
 }
 
-// 私有段落与官方原文不存在 >=8 token 的字面重叠（除 <analysis>/<summary> 标记名）。
+// 私有段落与官方原文不存在 >=8 token 的字面重叠。
 func TestDSHPrivatePromptHasNoLongOverlap(t *testing.T) {
 	enabled, name := dshPrivatePromptSettings()
 	_ = enabled
 	private := renderDSHPrivateIdentity("deepseek-v4.1-flash", name) + "\n\n" +
-		dshPrivateSummaryBlock + "\n\n" + dshPrivateCheckoutBlock + "\n\n" +
+		dshPrivateCheckoutBlock + "\n\n" +
 		dshPrivateGUIOpening + dshPrivateGUIRest + "\n\n" + dshPrivateAtPathsBlock
 	official := officialPromptSentences
 

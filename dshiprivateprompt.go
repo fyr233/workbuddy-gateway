@@ -9,12 +9,12 @@ import (
 
 // DSH 私有系统提示词。
 //
-// 目标：把 DSH 默认系统提示词的 4 段整段重写为中性中文表述，与官方原文不存在
+// 目标：把 DSH 默认系统提示词中的官方段落整段重写为中性中文表述，与官方原文不存在
 // >=8 token 的字面重叠，从而不受上游针对官方提示词的字符串规则影响。
 //
 // 边界（重要）：
-//   - 只处理"默认系统提示词"的 4 段：身份句、禁止主动产出摘要、checkout 与工作目录、
-//     GUI 交互。
+//   - 只处理"默认系统提示词"：身份句、checkout 与工作目录、GUI 交互（整段重写），
+//     以及禁止主动产出摘要那句（整段删除，不替换成私有段落）。
 //   - 插件注入的段落（@ 路径、exit code、read/glob/grep、后台任务、web_search、
 //     create_goal、workflow、subagent、MCP 资源、图片链接格式）整段不碰。
 //   - DSH 采用整段私有系统提示词；Hermes 仅改写官方模型身份首句，其他 harness 零改动。
@@ -70,9 +70,6 @@ const (
 		"不要客套（“好问题”“我很乐意”）、不要复述用户请求、不要重复已说过的结论、不要讲解用户已经看到的工具调用。" +
 		"用明确陈述代替形容词堆砌；不确定就直说不确定。赞同是因为它成立，不是因为用户先说了。" +
 		"深度按需给：用户要细节、在教你、或风险高时才展开。"
-
-	dshPrivateSummaryBlock = "除非用户明确要求，否则绝不产出对话摘要、检查点，也不输出 " +
-		"<analysis>/<summary> 块：上下文压缩由运行时负责，你主动附上的摘要会取代你本该完成的工作。"
 
 	dshPrivateCheckoutBlock = "运行时上下文给出了本实现代码的检出副本位置。检出位置与当前工作目录是两个独立的值，" +
 		"可能不同；绝不可由检出路径推断工作目录。用 pwd 确定当前工作目录。该检出副本仅用于查看或扩展本实现自身。"
@@ -389,9 +386,9 @@ func dshPrivateReplaceSegment(segment, model, agentName string) (string, bool) {
 		return dshPrivateAtPathsBlock + keepClientSentences(trimmed), true
 	}
 
-	// [02] 禁止主动产出摘要：整句替换。
+	// [02] 禁止主动产出摘要：整段删除（只保留客户端自己追加的句子）。
 	if strings.HasPrefix(trimmed, dshOfficialSummaryPrefix) {
-		return dshPrivateSummaryBlock + keepClientSentences(trimmed), true
+		return keepClientSentences(trimmed), true
 	}
 
 	// [19] checkout 与工作目录：整段替换。
@@ -446,7 +443,6 @@ func officialSegmentStart(trimmed string) int {
 func isDSHPrivateSegment(trimmed string) bool {
 	for _, marker := range []string{
 		"一名编码智能体，底层模型为",
-		"上下文压缩由运行时负责",
 		"检出副本位置",
 		"你正通过 Web GUI 与用户交互",
 		"以 @ 开头的记号表示用户点名引用的路径",
@@ -730,6 +726,11 @@ func rewriteDSHSystemText(text, model, agentName string) (string, int) {
 		replacement, hit := dshPrivateReplaceSegment(segment, model, agentName)
 		if !hit {
 			out = append(out, segment)
+			continue
+		}
+		// 整段删除（例如已废弃的摘要禁令段）：不产出空段落。
+		if strings.TrimSpace(replacement) == "" {
+			replaced++
 			continue
 		}
 		// 身份句可能出现两次（客户端覆写 + 官方原句），只保留一句。
