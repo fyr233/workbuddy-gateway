@@ -182,7 +182,8 @@ func TestBurnDownProportionalToDeadline(t *testing.T) {
 	}
 }
 
-// 越 48h 软线的账号应被压到最低权重，避免撞上游硬墙。
+// 越过软线的账号应被压到最低权重，避免撞上游硬墙。
+// 惩罚按模型判定：被压低的只有越线的那个模型，别的模型不受牵连。
 func TestPriorityWeightPenalisesWindowOverLimit(t *testing.T) {
 	now := time.Now()
 	acc := creditAccount("hot.json", 1000, 50, now)
@@ -194,7 +195,9 @@ func TestPriorityWeightPenalisesWindowOverLimit(t *testing.T) {
 	tokenWindows[acc.Path] = &accountTokenWindow{
 		Path:    acc.Path,
 		Edition: "cn",
-		Buckets: []tokenBucket{{Hour: now.Truncate(time.Hour).Unix(), Tokens: 200_000_000}},
+		ModelBuckets: map[string][]tokenBucket{
+			testModel: {{Hour: now.Truncate(time.Hour).Unix(), Tokens: 200_000_000}},
+		},
 	}
 	tokenWindowMu.Unlock()
 	defer func() {
@@ -203,9 +206,15 @@ func TestPriorityWeightPenalisesWindowOverLimit(t *testing.T) {
 		tokenWindowMu.Unlock()
 	}()
 
-	penalised := accountPriorityWeight(acc, now)
+	penalised := accountPriorityWeightForModel(acc, testModel, now)
 	if penalised > base*0.02 || penalised < base*0.005 {
 		t.Fatalf("软线惩罚倍率异常：base=%v penalised=%v", base, penalised)
 	}
 	t.Logf("base=%v penalised=%v 倍率=%.4f", base, penalised, penalised/base)
+
+	// 同一账号在没越线的模型上必须拿到全权重。
+	other := accountPriorityWeightForModel(acc, "glm-x", now)
+	if other != base {
+		t.Fatalf("未越线的模型不该被连带降权：base=%v other=%v", base, other)
+	}
 }

@@ -45,7 +45,9 @@ func TestFreeModelFallsBackAfterWindowOverLimit(t *testing.T) {
 	tokenWindowMu.Lock()
 	tokenWindows["cn.json"] = &accountTokenWindow{
 		Path: "cn.json", Edition: "cn",
-		Buckets: []tokenBucket{{Hour: now.Truncate(time.Hour).Unix(), Tokens: 300_000_000}},
+		ModelBuckets: map[string][]tokenBucket{
+			"hy3": {{Hour: now.Truncate(time.Hour).Unix(), Tokens: 300_000_000}},
+		},
 	}
 	tokenWindowMu.Unlock()
 	defer func() {

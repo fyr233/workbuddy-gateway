@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.43"
+	version = "1.14.47"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -1434,7 +1434,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 					break
 				}
 				kind, ok := usableForModelLocked(acc, model, now)
-				if !ok || windowOverLimit(acc) {
+				if !ok || windowOverLimit(acc, model) {
 					stickyUnbind(sessionKey)
 					break
 				}
@@ -1468,14 +1468,14 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 				if siteFilter != nil && !siteFilter(accSiteLocked(acc)) {
 					continue
 				}
-				if skipOverLimit && windowOverLimit(acc) {
+				if skipOverLimit && windowOverLimit(acc, model) {
 					continue
 				}
 				kind, ok := usableForModelLocked(acc, model, now)
 				if !ok || kind != wanted {
 					continue
 				}
-				score := weightScore(acc.Path, accountPriorityWeight(acc, now))
+				score := weightScore(acc.Path, accountPriorityWeightForModel(acc, model, now))
 				if best == nil || score < bestScore {
 					best, bestKind, bestScore = acc, kind, score
 				}
@@ -1511,12 +1511,18 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 		stickyBind(sessionKey, acc.Path, now)
 		return acc, kind, nil
 	}
-	// 全部账号越过 24h 软线时的保底选号：取窗口余量最大者。
-	// 不继续按积分权重挑，因为高权重号通常也最接近硬墙，
-	// 先吃穿它会让随后的冷却时间最长。
+	// 全部账号越过 24h 软线时的保底选号：取该模型窗口余量最大者。
+	//
+	// 这段以前只挑「余量最大」就无条件放行，实测被吃穿：全部账号越线后每 15 秒
+	// 一轮、每轮涨 78 万 token，从 190M 一路推到 206M 才撞 6004（见 11-20 12:58 日志）。
+	//
+	// 但不能因此改成拒绝：服务可用性优先。拒绝请求是 100% 失败，撞 6004 只冷却
+	// 「该账号 × 该模型」这一个组合，其他账号和模型照常可用，代价小得多。
+	// 所以这里只做「已过硬墙的排最后」，兜底仍然放行。
 	var headroomAcc *Account
 	var headroomKind accountSelectionKind
 	var headroom int64
+	var headroomPastHard bool
 	for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
 		for _, acc := range accounts {
 			if attempted != nil && attempted[acc] {
@@ -1529,9 +1535,13 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 			if !ok || kind != wanted {
 				continue
 			}
-			h := windowHeadroom(acc)
-			if headroomAcc == nil || h > headroom {
-				headroomAcc, headroomKind, headroom = acc, kind, h
+			pastHard := windowHardExceeded(acc, model)
+			h := windowHeadroom(acc, model)
+			// 未过硬墙的一律优先；同类里比余量，余量相同则比越线距离。
+			if headroomAcc == nil ||
+				(headroomPastHard && !pastHard) ||
+				(headroomPastHard == pastHard && h > headroom) {
+				headroomAcc, headroomKind, headroom, headroomPastHard = acc, kind, h, pastHard
 			}
 		}
 		if headroomAcc != nil {
@@ -1539,9 +1549,14 @@ func nextAccountForModel(model string, attempted map[*Account]bool, sessionKey s
 		}
 	}
 	if headroomAcc != nil {
-		total, limit := accountWindowUsage(headroomAcc)
-		log.Printf("[TokenWindow] 模型 %s 全部账号均已越过 24h 软线，回退使用余量最大的 %s（窗口内=%d 阈值=%d）",
-			model, filepath.Base(headroomAcc.Path), total, limit)
+		total, limit := accountWindowUsage(headroomAcc, model)
+		if headroomPastHard {
+			log.Printf("[TokenWindow] 模型 %s 全部账号均已越过 24h 软线，且余量最大的账号也已过实测硬墙=%d，仍放行以保证可用性（%s 本模型窗口内=%d 软线=%d）",
+				model, accountTokenHardLimit(headroomAcc), filepath.Base(headroomAcc.Path), total, limit)
+		} else {
+			log.Printf("[TokenWindow] 模型 %s 全部账号均已越过 24h 软线，回退使用余量最大的 %s（本模型窗口内=%d 软线=%d）",
+				model, filepath.Base(headroomAcc.Path), total, limit)
+		}
 		if headroomKind == selectionProbeExhausted {
 			modelStateLocked(headroomAcc, model).NextProbeAt = now.Add(modelProbeDelay)
 		}
@@ -2364,7 +2379,7 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	// 每次拿到上游 usage 都计入 24h 滚动窗口：这是该窗口唯一的记账入口，
 	// 放在 credit 判空之前，才能覆盖免费模型（credit=0 但同样消耗 token 配额）。
 	if acc != nil {
-		recordAccountTokens(acc, tokenCountOf(usage))
+		recordAccountTokens(acc, model, tokenCountOf(usage))
 	}
 	credit, ok := usageCredit(usage)
 	if !ok || acc == nil {

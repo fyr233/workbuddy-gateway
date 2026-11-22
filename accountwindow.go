@@ -65,12 +65,21 @@ const (
 type tokenBucket struct {
 	Hour   int64 `json:"hour"` // Unix 小时（UTC）
 	Tokens int64 `json:"tokens"`
+	// Model 是该桶归属的模型（归一化后）。空串表示旧格式的账号级合计桶。
+	Model string `json:"model,omitempty"`
 }
 
+// accountTokenWindow 是单个账号的滚动窗口。
+//
+// ModelBuckets 按模型分开计数：上游 6004 的语义是按模型限流（实测 10 次触发点，
+// 同账号其它模型用量都是 0.0M，触发时永远是当前模型自己到 200M）。若把所有模型
+// 合并计数，跑一个小模型就会平白吃掉大模型的软限预算，让大模型提前被软排除，
+// 反而加速撞硬墙。Buckets 只用于兼容旧落盘文件，读入时迁移进 ModelBuckets。
 type accountTokenWindow struct {
-	Path    string        `json:"path"`
-	Edition string        `json:"edition"`
-	Buckets []tokenBucket `json:"buckets"`
+	Path         string         `json:"path"`
+	Edition      string         `json:"edition"`
+	Buckets      []tokenBucket  `json:"buckets,omitempty"` // 旧格式：账号级合计，已废弃
+	ModelBuckets map[string][]tokenBucket `json:"modelBuckets,omitempty"`
 }
 
 type tokenWindowFileFormat struct {
@@ -169,22 +178,38 @@ func loadTokenWindowsLocked() {
 	}
 }
 
+// pruneBucketsLocked 裁掉滑出 24h 窗口的桶，并迁移旧格式（账号级合计）。
 func pruneBucketsLocked(w *accountTokenWindow, hour int64) {
 	// hour 是 Unix 小时戳（秒），窗口长度必须换算成秒：tokenWindowHours*3600。
 	// 这里曾经写成 hour - tokenWindowHours，等于只减 48 秒，
 	// 于是 24 小时窗口退化成「当前这一小时」，软限几乎永不触发（见 window_prune_test.go）。
 	cut := hour - tokenWindowHours*3600
-	out := w.Buckets[:0]
-	for _, b := range w.Buckets {
-		if b.Hour > cut && b.Tokens > 0 {
-			out = append(out, b)
+	if w.ModelBuckets == nil {
+		w.ModelBuckets = make(map[string][]tokenBucket)
+	}
+	// 旧文件只有账号级 Buckets：没有模型维度，无法拆分，只能整体丢弃。
+	// 保留会与按模型计数叠加（双计），丢掉的代价仅是一天的窗口从零重算。
+	if len(w.Buckets) > 0 {
+		log.Printf("[TokenWindow] 账号 %s 的窗口是旧格式（账号级合计，无模型维度），已丢弃重算", w.Path)
+		w.Buckets = nil
+	}
+	for model, buckets := range w.ModelBuckets {
+		out := buckets[:0]
+		for _, b := range buckets {
+			if b.Hour > cut && b.Tokens > 0 {
+				out = append(out, b)
+			}
 		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Hour < out[j].Hour })
+		if len(out) > tokenWindowBucketCap {
+			out = out[len(out)-tokenWindowBucketCap:]
+		}
+		if len(out) == 0 {
+			delete(w.ModelBuckets, model)
+			continue
+		}
+		w.ModelBuckets[model] = out
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Hour < out[j].Hour })
-	if len(out) > tokenWindowBucketCap {
-		out = out[len(out)-tokenWindowBucketCap:]
-	}
-	w.Buckets = out
 }
 
 // accountEditionOf 取账号站点标识（cn / intl），不依赖 accountMu。
@@ -205,6 +230,7 @@ func accountEditionOf(acc *Account) string {
 //
 // 付费账号：限流规则未知。不猜一个值上去，直接返回 0 = 不纳入软限，
 // 靠 429 反馈被动冷却。等有实测样本再补。
+// accountTokenLimit 返回软阈值（实测硬墙的 95%）。
 func accountTokenLimit(acc *Account) int64 {
 	if windowDisabled || acc == nil {
 		return 0
@@ -218,6 +244,34 @@ func accountTokenLimit(acc *Account) int64 {
 	default:
 		return windowLimitCN
 	}
+}
+
+// accountTokenHardLimit 返回该账号的硬上限估计（软线 / 0.95，即实测硬墙本身）。
+//
+// 软线定在实测值的 95%，留出的 5% 是缓冲：越线后仍可放行少量请求，
+// 但一旦逼近硬墙就必须彻底停用，不能继续放行 —— 否则缓冲被吃光，
+// 必然撞 6004，换来 16~30 小时的模型冷却，代价远大于那 5% 的额度。
+func accountTokenHardLimit(acc *Account) int64 {
+	soft := accountTokenLimit(acc)
+	if soft <= 0 {
+		return 0
+	}
+	// soft 是实测硬墙的 95%：反推硬墙。
+	return soft * 100 / 95
+}
+
+// windowHardExceeded 判断该账号在该模型上是否已越过实测硬墙。
+//
+// 注意：这只用于**排序和告警**，不是拒绝服务的依据。服务可用性优先：
+// 达到硬墙的账号仍会被选中（排在全部分账号之后），因为「拒绝请求」是 100% 失败，
+// 而撞 6004 只冷却「该账号 × 该模型」这一个组合，其他账号和模型照常可用。
+func windowHardExceeded(acc *Account, model string) bool {
+	hard := accountTokenHardLimit(acc)
+	if hard <= 0 {
+		return false
+	}
+	total, _ := accountWindowUsage(acc, model)
+	return total >= hard
 }
 
 // tokenCountOf 从上游 usage 取总 token（含缓存命中），取不到返回 0。
@@ -271,6 +325,14 @@ const (
 // 这与旧的「按 QuotaTotal 加权」有本质区别：旧口径只看周期总额，不看剩多少，
 // 于是总额最大的号被派最多请求、最先被打空 —— 正是 cn 账号被用光的原因。
 func accountPriorityWeight(acc *Account, now time.Time) float64 {
+	return accountPriorityWeightForModel(acc, "", now)
+}
+
+// accountPriorityWeightForModel 是 accountPriorityWeight 的带模型版本。
+//
+// 软线惩罚必须按模型判定：上游 6004 只封当前模型，账号在别的模型上还有额度时
+// 不该被压到 1% 权重。model 为空时只按账号余额计算（用于报表展示）。
+func accountPriorityWeightForModel(acc *Account, model string, now time.Time) float64 {
 	if acc == nil {
 		return priorityWeightFloor
 	}
@@ -302,8 +364,12 @@ func accountPriorityWeight(acc *Account, now time.Time) float64 {
 	w := remain / horizon.Hours()
 	// 已经越过 24h 软线的账号压到最低：它再吃流量就会撞上游硬墙，
 	// 而硬墙冷却 16~30 小时，比等它自然过期的代价大得多。
-	if windowOverLimit(acc) {
-		w *= 0.01
+	// 按模型判定：软线是按模型计的，其它模型还有额度时不该被连坐。
+	// model 为空（报表展示）时取窗口内最吃紧的模型来代表该账号状态。
+	if model != "" {
+		if windowOverLimit(acc, model) {
+			w *= 0.01
+		}
 	}
 	if w < priorityWeightFloor {
 		w = priorityWeightFloor
@@ -348,9 +414,17 @@ func bumpWeight(acc *Account) {
 	weightMu.Unlock()
 }
 
-// recordAccountTokens 把一次成功响应的 token 数计入该账号的滚动窗口。
-func recordAccountTokens(acc *Account, tokens int64) {
+// recordAccountTokens 把一次成功响应的 token 数计入该账号在该模型上的滚动窗口。
+//
+// 必须带 model：上游 6004 是按模型限流的，实测 10 次触发点的同账号「其它模型」
+// 用量都是 0.0M——触发时永远是当前模型自己到 200M。按账号合并计数会让小模型
+// 吃掉大模型的软限预算，使大模型提前被软排除。
+func recordAccountTokens(acc *Account, model string, tokens int64) {
 	if windowDisabled || acc == nil || tokens <= 0 {
+		return
+	}
+	model = normalizeModelName(model)
+	if model == "" {
 		return
 	}
 	hour := time.Now().Truncate(time.Hour).Unix()
@@ -365,17 +439,19 @@ func recordAccountTokens(acc *Account, tokens int64) {
 	}
 	pruneBucketsLocked(w, hour)
 	found := false
-	for i := range w.Buckets {
-		if w.Buckets[i].Hour == hour {
-			w.Buckets[i].Tokens += tokens
+	buckets := w.ModelBuckets[model]
+	for i := range buckets {
+		if buckets[i].Hour == hour {
+			buckets[i].Tokens += tokens
 			found = true
 			break
 		}
 	}
 	if !found {
-		w.Buckets = append(w.Buckets, tokenBucket{Hour: hour, Tokens: tokens})
+		buckets = append(buckets, tokenBucket{Hour: hour, Tokens: tokens, Model: model})
 	}
-	total := windowTotalLocked(w)
+	w.ModelBuckets[model] = buckets
+	total := windowTotalLocked(w, model)
 	limit := accountTokenLimit(acc)
 	needSave := time.Since(tokenWindowLast) > tokenWindowSaveEvery
 	if needSave {
@@ -391,16 +467,39 @@ func recordAccountTokens(acc *Account, tokens int64) {
 	}
 }
 
-func windowTotalLocked(w *accountTokenWindow) int64 {
+// windowTotalLocked 返回该账号在指定模型上的 24h 累计 token。
+func windowTotalLocked(w *accountTokenWindow, model string) int64 {
+	if w == nil {
+		return 0
+	}
 	var sum int64
-	for _, b := range w.Buckets {
+	for _, b := range w.ModelBuckets[model] {
 		sum += b.Tokens
 	}
 	return sum
 }
 
-// accountWindowUsage 返回该账号当前 24h 窗口内的累计 token 与阈值。
-func accountWindowUsage(acc *Account) (total int64, limit int64) {
+// windowMaxModelLocked 返回该账号窗口内用量最大的模型及其累计量。
+// 用于日志与「该账号还剩多少额度」的判断：按模型限流时，账号的可服务能力
+// 由最吃紧的那个模型决定，而不是所有模型加总。
+func windowMaxModelLocked(w *accountTokenWindow) (model string, total int64) {
+	if w == nil {
+		return "", 0
+	}
+	for m, buckets := range w.ModelBuckets {
+		var s int64
+		for _, b := range buckets {
+			s += b.Tokens
+		}
+		if s > total {
+			model, total = m, s
+		}
+	}
+	return model, total
+}
+
+// accountWindowUsage 返回该账号该模型当前 24h 窗口内的累计 token 与阈值。
+func accountWindowUsage(acc *Account, model string) (total int64, limit int64) {
 	if windowDisabled || acc == nil {
 		return 0, 0
 	}
@@ -413,20 +512,20 @@ func accountWindowUsage(acc *Account) (total int64, limit int64) {
 		return 0, limit
 	}
 	pruneBucketsLocked(w, hour)
-	total = windowTotalLocked(w)
+	total = windowTotalLocked(w, normalizeModelName(model))
 	tokenWindowMu.Unlock()
 	return total, limit
 }
 
-// windowOverLimit 判断该账号是否已越过 24h 软阈值。
-func windowOverLimit(acc *Account) bool {
-	total, limit := accountWindowUsage(acc)
+// windowOverLimit 判断该账号在指定模型上是否已越过 24h 软阈值。
+func windowOverLimit(acc *Account, model string) bool {
+	total, limit := accountWindowUsage(acc, model)
 	return limit > 0 && total >= limit
 }
 
-// windowHeadroom 返回剩余余量（用于「全部越线时挑余量最大者」的保底选择）。
-func windowHeadroom(acc *Account) int64 {
-	total, limit := accountWindowUsage(acc)
+// windowHeadroom 返回该账号该模型剩余余量（用于「全部越线时挑余量最大者」的保底选择）。
+func windowHeadroom(acc *Account, model string) int64 {
+	total, limit := accountWindowUsage(acc, model)
 	if limit <= 0 {
 		return 1 << 62
 	}
@@ -462,7 +561,7 @@ func tokenWindowGC() {
 		tokenWindowMu.Lock()
 		for path, w := range tokenWindows {
 			pruneBucketsLocked(w, hour)
-			if len(w.Buckets) == 0 {
+			if len(w.ModelBuckets) == 0 {
 				delete(tokenWindows, path)
 			}
 		}
@@ -471,12 +570,30 @@ func tokenWindowGC() {
 	}
 }
 
-// formatTokenWindowLine 生成监控/日志用的一行摘要。
-func formatTokenWindowLine(acc *Account) string {
-	total, limit := accountWindowUsage(acc)
+// formatTokenWindowLine 生成监控/日志用的一行摘要（取窗口内最吃紧的模型）。
+func formatTokenWindowLine(acc *Account, model string) string {
+	if model == "" {
+		// 调用方只想知道整体状态时，报告用量最大的模型。
+		hour := time.Now().Truncate(time.Hour).Unix()
+		tokenWindowMu.Lock()
+		w := tokenWindows[acc.Path]
+		if w != nil {
+			pruneBucketsLocked(w, hour)
+			model, _ = windowMaxModelLocked(w)
+		}
+		tokenWindowMu.Unlock()
+		if model == "" {
+			total, limit := accountWindowUsage(acc, model)
+			if limit <= 0 {
+				return ""
+			}
+			return fmt.Sprintf("%.1f%%(%d/%d)", float64(total)/float64(limit)*100, total, limit)
+		}
+	}
+	total, limit := accountWindowUsage(acc, model)
 	if limit <= 0 {
 		return ""
 	}
 	pct := float64(total) / float64(limit) * 100
-	return fmt.Sprintf("%.1f%%(%d/%d)", pct, total, limit)
+	return fmt.Sprintf("%s %.1f%%(%d/%d)", model, pct, total, limit)
 }
